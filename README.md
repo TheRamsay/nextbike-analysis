@@ -41,6 +41,17 @@ nohup .venv/bin/nextbike poll --interval-seconds 60 --no-include-free-bikes >> d
 echo $! > data/poller.pid
 ```
 
+Inspect the local database:
+
+```bash
+uv run nextbike db-stats
+uv run nextbike latest
+uv run nextbike top-stations --limit 10
+uv run nextbike top-stations --by avg --limit 10
+uv run nextbike empty-stations --limit 20
+uv run nextbike empty-stations --by empty-rate --limit 20
+```
+
 By default data is written to:
 
 - raw JSON snapshots: `data/raw/`

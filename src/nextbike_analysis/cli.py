@@ -4,6 +4,7 @@ import time
 from pathlib import Path
 from typing import Annotated
 
+import duckdb
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -28,6 +29,29 @@ def make_settings(
         db_path=db_path or defaults.db_path,
         request_timeout_seconds=defaults.request_timeout_seconds,
     )
+
+
+def connect_db(db_path: Path) -> duckdb.DuckDBPyConnection:
+    if not db_path.exists():
+        raise typer.BadParameter(f"Database does not exist: {db_path}")
+    return duckdb.connect(str(db_path), read_only=True)
+
+
+LATEST_STATION_INFO_SQL = """
+select station_id, name, short_name, region_id, lat, lon
+from (
+    select
+        station_id,
+        name,
+        short_name,
+        region_id,
+        lat,
+        lon,
+        row_number() over (partition by station_id order by observed_at desc) as rn
+    from station_information
+)
+where rn = 1
+"""
 
 
 @app.command()
@@ -122,3 +146,261 @@ def poll(
             break
         time.sleep(interval_seconds)
 
+
+@app.command("db-stats")
+def db_stats(
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+) -> None:
+    """Show high-level stats for the local collection database."""
+    settings = make_settings(None, None, db_path)
+    with connect_db(settings.db_path) as con:
+        row = con.sql(
+            """
+            select
+                count(*) as runs,
+                min(collected_at) as first_collected_at,
+                max(collected_at) as latest_collected_at,
+                sum(station_count) as station_status_rows,
+                max(station_count) as max_station_count,
+                max(bikes_available) as max_bikes_available
+            from collection_runs
+            """
+        ).fetchone()
+        distinct_stations = con.sql(
+            "select count(distinct station_id) from station_status_snapshots"
+        ).fetchone()[0]
+        latest = con.sql(
+            """
+            select station_count, bikes_available, free_bike_count, raw_path
+            from collection_runs
+            order by collected_at desc
+            limit 1
+            """
+        ).fetchone()
+
+    table = Table(title=f"Database stats: {settings.db_path}")
+    table.add_column("Metric")
+    table.add_column("Value")
+    table.add_row("collection runs", str(row[0]))
+    table.add_row("first collected", str(row[1]))
+    table.add_row("latest collected", str(row[2]))
+    table.add_row("station rows", str(row[3]))
+    table.add_row("distinct stations", str(distinct_stations))
+    table.add_row("max stations/snapshot", str(row[4]))
+    table.add_row("max bikes available", str(row[5]))
+    if latest is not None:
+        table.add_row("latest station count", str(latest[0]))
+        table.add_row("latest bikes available", str(latest[1]))
+        table.add_row("latest free bike rows", str(latest[2]))
+        table.add_row("latest raw path", str(latest[3]))
+    console.print(table)
+
+
+@app.command()
+def latest(
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+) -> None:
+    """Show summary metrics for the newest snapshot."""
+    settings = make_settings(None, None, db_path)
+    with connect_db(settings.db_path) as con:
+        row = con.sql(
+            """
+            with latest_run as (
+                select collected_at
+                from collection_runs
+                order by collected_at desc
+                limit 1
+            )
+            select
+                r.collected_at,
+                r.station_count,
+                r.bikes_available,
+                r.free_bike_count,
+                count_if(s.num_bikes_available = 0) as empty_stations,
+                count_if(s.num_bikes_available > 0) as stations_with_bikes,
+                round(avg(s.num_bikes_available), 2) as avg_bikes_per_station,
+                max(s.num_bikes_available) as max_bikes_at_station,
+                r.raw_path
+            from collection_runs r
+            join latest_run lr using (collected_at)
+            join station_status_snapshots s using (collected_at)
+            group by
+                r.collected_at,
+                r.station_count,
+                r.bikes_available,
+                r.free_bike_count,
+                r.raw_path
+            """
+        ).fetchone()
+
+    if row is None:
+        console.print("[yellow]No collection runs found.[/yellow]")
+        return
+
+    table = Table(title="Latest snapshot")
+    table.add_column("Metric")
+    table.add_column("Value")
+    labels = (
+        "collected_at",
+        "station_count",
+        "bikes_available",
+        "free_bike_count",
+        "empty_stations",
+        "stations_with_bikes",
+        "avg_bikes_per_station",
+        "max_bikes_at_station",
+        "raw_path",
+    )
+    for label, value in zip(labels, row, strict=True):
+        table.add_row(label, str(value))
+    console.print(table)
+
+
+@app.command("top-stations")
+def top_stations(
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+    limit: Annotated[int, typer.Option(help="Maximum station rows to show.")] = 15,
+    by: Annotated[str, typer.Option(help="Ranking mode: latest or avg.")] = "latest",
+) -> None:
+    """Show stations with the most bikes, either in the latest snapshot or on average."""
+    if limit <= 0:
+        raise typer.BadParameter("limit must be positive")
+    if by not in {"latest", "avg"}:
+        raise typer.BadParameter("by must be either 'latest' or 'avg'")
+
+    settings = make_settings(None, None, db_path)
+    with connect_db(settings.db_path) as con:
+        if by == "latest":
+            rows = con.execute(
+                f"""
+                with latest_run as (
+                    select collected_at
+                    from collection_runs
+                    order by collected_at desc
+                    limit 1
+                ),
+                station_info as ({LATEST_STATION_INFO_SQL})
+                select
+                    s.station_id,
+                    coalesce(i.name, s.station_id) as name,
+                    i.region_id,
+                    s.num_bikes_available,
+                    s.num_docks_available,
+                    to_timestamp(s.last_reported) as last_reported
+                from station_status_snapshots s
+                join latest_run lr using (collected_at)
+                left join station_info i using (station_id)
+                order by s.num_bikes_available desc, name
+                limit ?
+                """,
+                [limit],
+            ).fetchall()
+        else:
+            rows = con.execute(
+                f"""
+                with station_info as ({LATEST_STATION_INFO_SQL})
+                select
+                    s.station_id,
+                    coalesce(i.name, s.station_id) as name,
+                    i.region_id,
+                    round(avg(s.num_bikes_available), 2) as avg_bikes_available,
+                    max(s.num_bikes_available) as max_bikes_available,
+                    count(*) as samples
+                from station_status_snapshots s
+                left join station_info i using (station_id)
+                group by s.station_id, i.name, i.region_id
+                order by avg_bikes_available desc, name
+                limit ?
+                """,
+                [limit],
+            ).fetchall()
+
+    table = Table(title=f"Top stations by {by}")
+    table.add_column("Station ID")
+    table.add_column("Name")
+    table.add_column("Region")
+    if by == "latest":
+        table.add_column("Bikes", justify="right")
+        table.add_column("Docks", justify="right")
+        table.add_column("Last reported")
+    else:
+        table.add_column("Avg bikes", justify="right")
+        table.add_column("Max bikes", justify="right")
+        table.add_column("Samples", justify="right")
+    for row in rows:
+        table.add_row(*(str(value) for value in row))
+    console.print(table)
+
+
+@app.command("empty-stations")
+def empty_stations(
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+    limit: Annotated[int, typer.Option(help="Maximum station rows to show.")] = 30,
+    by: Annotated[str, typer.Option(help="Ranking mode: latest or empty-rate.")] = "latest",
+) -> None:
+    """Show empty stations now, or stations with the highest historical empty rate."""
+    if limit <= 0:
+        raise typer.BadParameter("limit must be positive")
+    if by not in {"latest", "empty-rate"}:
+        raise typer.BadParameter("by must be either 'latest' or 'empty-rate'")
+
+    settings = make_settings(None, None, db_path)
+    with connect_db(settings.db_path) as con:
+        if by == "latest":
+            rows = con.execute(
+                f"""
+                with latest_run as (
+                    select collected_at
+                    from collection_runs
+                    order by collected_at desc
+                    limit 1
+                ),
+                station_info as ({LATEST_STATION_INFO_SQL})
+                select
+                    s.station_id,
+                    coalesce(i.name, s.station_id) as name,
+                    i.region_id,
+                    to_timestamp(s.last_reported) as last_reported
+                from station_status_snapshots s
+                join latest_run lr using (collected_at)
+                left join station_info i using (station_id)
+                where s.num_bikes_available = 0
+                order by name
+                limit ?
+                """,
+                [limit],
+            ).fetchall()
+        else:
+            rows = con.execute(
+                f"""
+                with station_info as ({LATEST_STATION_INFO_SQL})
+                select
+                    s.station_id,
+                    coalesce(i.name, s.station_id) as name,
+                    i.region_id,
+                    round(avg(case when s.num_bikes_available = 0 then 1.0 else 0.0 end), 3)
+                        as empty_rate,
+                    count(*) as samples,
+                    round(avg(s.num_bikes_available), 2) as avg_bikes_available
+                from station_status_snapshots s
+                left join station_info i using (station_id)
+                group by s.station_id, i.name, i.region_id
+                order by empty_rate desc, samples desc, name
+                limit ?
+                """,
+                [limit],
+            ).fetchall()
+
+    table = Table(title=f"Empty stations by {by}")
+    table.add_column("Station ID")
+    table.add_column("Name")
+    table.add_column("Region")
+    if by == "latest":
+        table.add_column("Last reported")
+    else:
+        table.add_column("Empty rate", justify="right")
+        table.add_column("Samples", justify="right")
+        table.add_column("Avg bikes", justify="right")
+    for row in rows:
+        table.add_row(*(str(value) for value in row))
+    console.print(table)
