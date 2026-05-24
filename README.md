@@ -51,6 +51,7 @@ uv run nextbike top-stations --by avg --limit 10
 uv run nextbike empty-stations --limit 20
 uv run nextbike empty-stations --by empty-rate --limit 20
 uv run nextbike nearest --lat 49.1951 --lon 16.6068
+uv run nextbike nearest --whereami
 ```
 
 By default data is written to:

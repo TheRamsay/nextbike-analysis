@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Annotated
 
 import duckdb
+import httpx
 import typer
 from rich.console import Console
 from rich.table import Table
@@ -52,6 +53,48 @@ from (
 )
 where rn = 1
 """
+
+
+def get_ip_location(timeout_seconds: float) -> tuple[float, float, str]:
+    providers = (
+        (
+            "ipapi.co",
+            "https://ipapi.co/json/",
+            lambda data: (
+                data.get("latitude"),
+                data.get("longitude"),
+                data.get("city"),
+                data.get("country_name"),
+            ),
+        ),
+        (
+            "ipwho.is",
+            "https://ipwho.is/",
+            lambda data: (
+                data.get("latitude"),
+                data.get("longitude"),
+                data.get("city"),
+                data.get("country"),
+            ),
+        ),
+    )
+    errors: list[str] = []
+    with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as client:
+        for provider_name, url, parser in providers:
+            try:
+                response = client.get(url)
+                response.raise_for_status()
+                data = response.json()
+                lat, lon, city, country = parser(data)
+                if lat is None or lon is None:
+                    errors.append(f"{provider_name}: missing latitude/longitude")
+                    continue
+                label = f"{provider_name} approximate location ({city}, {country})"
+                return float(lat), float(lon), label
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{provider_name}: {exc}")
+
+    raise typer.BadParameter("IP geolocation failed: " + "; ".join(errors))
 
 
 @app.command()
@@ -408,8 +451,8 @@ def empty_stations(
 
 @app.command()
 def nearest(
-    lat: Annotated[float, typer.Option(help="Latitude of the search origin.")],
-    lon: Annotated[float, typer.Option(help="Longitude of the search origin.")],
+    lat: Annotated[float | None, typer.Option(help="Latitude of the search origin.")] = None,
+    lon: Annotated[float | None, typer.Option(help="Longitude of the search origin.")] = None,
     db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
     limit: Annotated[int, typer.Option(help="Maximum station rows to show.")] = 10,
     max_distance_m: Annotated[
@@ -420,8 +463,21 @@ def nearest(
         bool,
         typer.Option(help="Include stations with zero available bikes."),
     ] = False,
+    whereami: Annotated[
+        bool,
+        typer.Option(help="Use approximate IP-based geolocation for the search origin."),
+    ] = False,
 ) -> None:
     """Show the nearest stations from the latest snapshot."""
+    location_label = "manual"
+    settings = make_settings(None, None, db_path)
+    if whereami:
+        if lat is not None or lon is not None:
+            raise typer.BadParameter("Use either --whereami or both --lat/--lon, not both")
+        lat, lon, location_label = get_ip_location(settings.request_timeout_seconds)
+
+    if lat is None or lon is None:
+        raise typer.BadParameter("Provide both --lat/--lon or use --whereami")
     if not -90 <= lat <= 90:
         raise typer.BadParameter("lat must be between -90 and 90")
     if not -180 <= lon <= 180:
@@ -431,7 +487,6 @@ def nearest(
     if max_distance_m is not None and max_distance_m <= 0:
         raise typer.BadParameter("max_distance_m must be positive")
 
-    settings = make_settings(None, None, db_path)
     bike_filter = "" if include_empty else "and s.num_bikes_available > 0"
     distance_filter = "" if max_distance_m is None else "where distance_m <= ?"
     params: list[float | int] = [lat, lat, lon]
@@ -495,4 +550,5 @@ def nearest(
     table.add_column("Lon", justify="right")
     for row in rows:
         table.add_row(*(str(value) for value in row))
+    console.print(f"[dim]Location source: {location_label}[/dim]")
     console.print(table)
