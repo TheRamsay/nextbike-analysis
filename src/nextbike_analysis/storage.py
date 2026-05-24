@@ -54,6 +54,23 @@ class SnapshotStore:
             )
             con.execute(
                 """
+                create table if not exists free_bike_status_snapshots (
+                    collected_at timestamptz not null,
+                    feed_last_updated bigint,
+                    bike_id varchar not null,
+                    is_reserved boolean,
+                    is_disabled boolean,
+                    lat double,
+                    lon double,
+                    vehicle_type_id varchar,
+                    station_id varchar,
+                    pricing_plan_id varchar,
+                    rental_uris json
+                )
+                """
+            )
+            con.execute(
+                """
                 create table if not exists station_information (
                     observed_at timestamptz not null,
                     feed_last_updated bigint,
@@ -136,6 +153,28 @@ class SnapshotStore:
                     for row in station_info_rows
                 ],
             )
+            if free_bike_rows:
+                con.executemany(
+                    """
+                    insert into free_bike_status_snapshots values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            collected_at,
+                            free_bike_status.get("last_updated"),
+                            row.get("bike_id"),
+                            row.get("is_reserved"),
+                            row.get("is_disabled"),
+                            row.get("lat"),
+                            row.get("lon"),
+                            row.get("vehicle_type_id"),
+                            row.get("station_id"),
+                            row.get("pricing_plan_id"),
+                            json.dumps(row.get("rental_uris", {}), ensure_ascii=False),
+                        )
+                        for row in free_bike_rows
+                    ],
+                )
             station_count = len(station_status_rows)
             bikes_available = sum(row.get("num_bikes_available") or 0 for row in station_status_rows)
             free_bike_count = len(free_bike_rows)
@@ -151,4 +190,3 @@ class SnapshotStore:
             "bikes_available": bikes_available,
             "free_bike_count": free_bike_count,
         }
-

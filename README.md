@@ -46,6 +46,7 @@ Inspect the local database:
 
 ```bash
 uv run nextbike db-stats
+uv run nextbike data-health
 uv run nextbike latest
 uv run nextbike top-stations --limit 10
 uv run nextbike top-stations --by avg --limit 10
