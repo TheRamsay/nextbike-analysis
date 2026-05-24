@@ -97,6 +97,27 @@ def get_ip_location(timeout_seconds: float) -> tuple[float, float, str]:
     raise typer.BadParameter("IP geolocation failed: " + "; ".join(errors))
 
 
+def get_address_location(address: str, timeout_seconds: float) -> tuple[float, float, str]:
+    headers = {"User-Agent": "nextbike-analysis/0.1 (local CLI geocoder)"}
+    params = {
+        "q": address,
+        "format": "jsonv2",
+        "limit": 1,
+        "addressdetails": 1,
+    }
+    with httpx.Client(timeout=timeout_seconds, follow_redirects=True, headers=headers) as client:
+        response = client.get("https://nominatim.openstreetmap.org/search", params=params)
+        response.raise_for_status()
+        results = response.json()
+
+    if not results:
+        raise typer.BadParameter(f"Address not found: {address}")
+
+    result = results[0]
+    display_name = result.get("display_name", address)
+    return float(result["lat"]), float(result["lon"]), f"Nominatim address match ({display_name})"
+
+
 @app.command()
 def info(
     gbfs_url: Annotated[str | None, typer.Option(help="GBFS discovery URL.")] = None,
@@ -453,6 +474,7 @@ def empty_stations(
 def nearest(
     lat: Annotated[float | None, typer.Option(help="Latitude of the search origin.")] = None,
     lon: Annotated[float | None, typer.Option(help="Longitude of the search origin.")] = None,
+    address: Annotated[str | None, typer.Option(help="Address to geocode as the search origin.")] = None,
     db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
     limit: Annotated[int, typer.Option(help="Maximum station rows to show.")] = 10,
     max_distance_m: Annotated[
@@ -471,13 +493,23 @@ def nearest(
     """Show the nearest stations from the latest snapshot."""
     location_label = "manual"
     settings = make_settings(None, None, db_path)
+    origin_modes = sum(
+        [
+            lat is not None or lon is not None,
+            address is not None,
+            whereami,
+        ]
+    )
+    if origin_modes != 1:
+        raise typer.BadParameter("Use exactly one origin: both --lat/--lon, --address, or --whereami")
+
     if whereami:
-        if lat is not None or lon is not None:
-            raise typer.BadParameter("Use either --whereami or both --lat/--lon, not both")
         lat, lon, location_label = get_ip_location(settings.request_timeout_seconds)
+    elif address is not None:
+        lat, lon, location_label = get_address_location(address, settings.request_timeout_seconds)
 
     if lat is None or lon is None:
-        raise typer.BadParameter("Provide both --lat/--lon or use --whereami")
+        raise typer.BadParameter("Provide both --lat and --lon")
     if not -90 <= lat <= 90:
         raise typer.BadParameter("lat must be between -90 and 90")
     if not -180 <= lon <= 180:
