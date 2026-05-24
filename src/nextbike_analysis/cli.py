@@ -682,6 +682,141 @@ def empty_stations(
 
 
 @app.command()
+def station(
+    station_ref: Annotated[str, typer.Argument(help="Station ID or case-insensitive name fragment.")],
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+    samples: Annotated[int, typer.Option(help="Number of recent snapshots to show.")] = 20,
+) -> None:
+    """Show station metadata, latest status, and recent availability trend."""
+    if samples <= 0:
+        raise typer.BadParameter("samples must be positive")
+
+    settings = make_settings(None, None, db_path)
+    with connect_db(settings.db_path) as con:
+        matches = con.execute(
+            f"""
+            with station_info as ({LATEST_STATION_INFO_SQL})
+            select station_id, name, short_name, region_id, lat, lon
+            from station_info
+            where station_id = ?
+                or contains(lower(name), lower(?))
+                or contains(lower(coalesce(short_name, '')), lower(?))
+            order by
+                case when station_id = ? then 0 else 1 end,
+                name
+            limit 25
+            """,
+            [station_ref, station_ref, station_ref, station_ref],
+        ).fetchall()
+
+        if not matches:
+            console.print(f"[yellow]No station found for {station_ref!r}.[/yellow]")
+            raise typer.Exit(code=1)
+
+        if len(matches) > 1 and not any(row[0] == station_ref for row in matches):
+            table = Table(title=f"Multiple stations match {station_ref!r}")
+            table.add_column("Station ID")
+            table.add_column("Name")
+            table.add_column("Short name")
+            table.add_column("Region")
+            table.add_column("Lat", justify="right")
+            table.add_column("Lon", justify="right")
+            for row in matches:
+                table.add_row(*(str(value) for value in row))
+            console.print(table)
+            raise typer.Exit(code=1)
+
+        selected = next((row for row in matches if row[0] == station_ref), matches[0])
+        station_id, name, short_name, region_id, lat, lon = selected
+
+        latest_row = con.execute(
+            """
+            select
+                collected_at,
+                num_bikes_available,
+                num_docks_available,
+                is_renting,
+                is_returning,
+                to_timestamp(last_reported) as last_reported
+            from station_status_snapshots
+            where station_id = ?
+            order by collected_at desc
+            limit 1
+            """,
+            [station_id],
+        ).fetchone()
+        aggregate_row = con.execute(
+            """
+            select
+                count(*) as samples,
+                round(avg(num_bikes_available), 2) as avg_bikes,
+                min(num_bikes_available) as min_bikes,
+                max(num_bikes_available) as max_bikes,
+                round(avg(case when num_bikes_available = 0 then 1.0 else 0.0 end), 3)
+                    as empty_rate
+            from station_status_snapshots
+            where station_id = ?
+            """,
+            [station_id],
+        ).fetchone()
+        trend_rows = con.execute(
+            """
+            select
+                collected_at,
+                num_bikes_available,
+                num_docks_available,
+                is_renting,
+                is_returning
+            from station_status_snapshots
+            where station_id = ?
+            order by collected_at desc
+            limit ?
+            """,
+            [station_id, samples],
+        ).fetchall()
+
+    summary = Table(title=f"Station {station_id}")
+    summary.add_column("Metric")
+    summary.add_column("Value")
+    summary.add_row("name", str(name))
+    summary.add_row("short_name", str(short_name))
+    summary.add_row("region", str(region_id))
+    summary.add_row("lat/lon", f"{lat}, {lon}")
+    if latest_row is not None:
+        summary.add_row("latest collected", str(latest_row[0]))
+        summary.add_row("latest bikes", str(latest_row[1]))
+        summary.add_row("latest risk", bike_risk(int(latest_row[1])))
+        summary.add_row("latest docks", str(latest_row[2]))
+        summary.add_row("renting/returning", f"{latest_row[3]}/{latest_row[4]}")
+        summary.add_row("last reported", str(latest_row[5]))
+    if aggregate_row is not None:
+        summary.add_row("samples", str(aggregate_row[0]))
+        summary.add_row("avg bikes", str(aggregate_row[1]))
+        summary.add_row("min/max bikes", f"{aggregate_row[2]}/{aggregate_row[3]}")
+        summary.add_row("empty rate", str(aggregate_row[4]))
+    console.print(summary)
+
+    trend = Table(title=f"Recent trend ({len(trend_rows)} samples)")
+    trend.add_column("Collected at")
+    trend.add_column("Bikes", justify="right")
+    trend.add_column("Risk")
+    trend.add_column("Docks", justify="right")
+    trend.add_column("Renting")
+    trend.add_column("Returning")
+    for row in reversed(trend_rows):
+        collected_at, bikes, docks, is_renting, is_returning = row
+        trend.add_row(
+            str(collected_at),
+            str(bikes),
+            bike_risk(int(bikes)),
+            str(docks),
+            str(is_renting),
+            str(is_returning),
+        )
+    console.print(trend)
+
+
+@app.command()
 def nearest(
     lat: Annotated[float | None, typer.Option(help="Latitude of the search origin.")] = None,
     lon: Annotated[float | None, typer.Option(help="Longitude of the search origin.")] = None,
