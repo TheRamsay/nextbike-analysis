@@ -6,6 +6,7 @@ from pathlib import Path
 from rich.console import Group
 from rich.text import Text
 
+from nextbike_analysis.boundary import BoundaryData, BoundaryPolygon, OSM_ATTRIBUTION
 from nextbike_analysis.db import LATEST_STATION_INFO_SQL, connect_db
 
 
@@ -107,8 +108,14 @@ def load_dashboard_data(db_path: Path, include_empty: bool) -> DashboardData:
     )
 
 
-def render_dashboard(data: DashboardData, width: int, height: int, background: str) -> Group:
-    map_text = render_ascii_map(data.points, width, height, background)
+def render_dashboard(
+    data: DashboardData,
+    width: int,
+    height: int,
+    background: str,
+    boundary: BoundaryData | None,
+) -> Group:
+    map_text = render_ascii_map(data.points, width, height, background, boundary)
     title = Text.assemble(
         ("Nextbike Brno dashboard", "bold"),
         ("  latest: ", "dim"),
@@ -126,12 +133,17 @@ def render_dashboard(data: DashboardData, width: int, height: int, background: s
         ("*", "bright_blue"),
         " multiple  ",
     ]
-    if background == "footprint":
+    if background == "osm" and boundary is not None:
+        legend_parts.extend([(":#", "dim"), f" {boundary.name} boundary  "])
+    elif background == "footprint":
         legend_parts.extend([(":,", "dim"), " footprint  "])
     legend_parts.append(
         ("Ctrl+C to quit", "dim"),
     )
     legend = Text.assemble(*legend_parts)
+    if background == "osm" and boundary is not None:
+        attribution = Text(f"{OSM_ATTRIBUTION} | OSM relation {boundary.osm_id}", style="dim")
+        return Group(title, stats, legend, map_text, attribution)
     return Group(title, stats, legend, map_text)
 
 
@@ -140,15 +152,18 @@ def render_ascii_map(
     width: int,
     height: int,
     background: str,
+    boundary: BoundaryData | None,
 ) -> Text:
     inner_width = max(width - 2, 10)
     inner_height = max(height - 2, 5)
     canvas = [[" " for _ in range(inner_width)] for _ in range(inner_height)]
     styles = [["" for _ in range(inner_width)] for _ in range(inner_height)]
 
-    if points:
-        min_lat, max_lat, min_lon, max_lon = padded_bounds(points)
-        if background == "footprint":
+    if points or boundary is not None:
+        min_lat, max_lat, min_lon, max_lon = padded_bounds(points, boundary)
+        if background == "osm" and boundary is not None:
+            draw_osm_boundary(canvas, styles, boundary, min_lat, max_lat, min_lon, max_lon)
+        elif background == "footprint" and points:
             draw_station_footprint(canvas, styles, points, min_lat, max_lat, min_lon, max_lon)
 
         for point in points:
@@ -183,11 +198,20 @@ def render_ascii_map(
     return text
 
 
-def padded_bounds(points: list[DashboardPoint]) -> tuple[float, float, float, float]:
-    min_lat = min(point.lat for point in points)
-    max_lat = max(point.lat for point in points)
-    min_lon = min(point.lon for point in points)
-    max_lon = max(point.lon for point in points)
+def padded_bounds(
+    points: list[DashboardPoint],
+    boundary: BoundaryData | None,
+) -> tuple[float, float, float, float]:
+    coords = [(point.lon, point.lat) for point in points]
+    if boundary is not None:
+        for polygon in boundary.polygons:
+            coords.extend(polygon.outer)
+            for hole in polygon.holes:
+                coords.extend(hole)
+    min_lon = min(lon for lon, _ in coords)
+    max_lon = max(lon for lon, _ in coords)
+    min_lat = min(lat for _, lat in coords)
+    max_lat = max(lat for _, lat in coords)
     lat_padding = max((max_lat - min_lat) * 0.08, 0.001)
     lon_padding = max((max_lon - min_lon) * 0.08, 0.001)
     return (
@@ -213,6 +237,91 @@ def project_point(
     x = min(width - 1, max(0, round(x_ratio * (width - 1))))
     y = min(height - 1, max(0, round(y_ratio * (height - 1))))
     return x, y
+
+
+def draw_osm_boundary(
+    canvas: list[list[str]],
+    styles: list[list[str]],
+    boundary: BoundaryData,
+    min_lat: float,
+    max_lat: float,
+    min_lon: float,
+    max_lon: float,
+) -> None:
+    height = len(canvas)
+    width = len(canvas[0])
+
+    for y in range(height):
+        lat = max_lat - (y / max(height - 1, 1)) * (max_lat - min_lat)
+        for x in range(width):
+            lon = min_lon + (x / max(width - 1, 1)) * (max_lon - min_lon)
+            if any(point_in_boundary_polygon((lon, lat), polygon) for polygon in boundary.polygons):
+                canvas[y][x] = ":"
+                styles[y][x] = "dim"
+
+    for polygon in boundary.polygons:
+        draw_boundary_ring(canvas, styles, polygon.outer, min_lat, max_lat, min_lon, max_lon)
+
+
+def draw_boundary_ring(
+    canvas: list[list[str]],
+    styles: list[list[str]],
+    ring: list[tuple[float, float]],
+    min_lat: float,
+    max_lat: float,
+    min_lon: float,
+    max_lon: float,
+) -> None:
+    height = len(canvas)
+    width = len(canvas[0])
+    previous: tuple[int, int] | None = None
+    for lon, lat in ring:
+        x, y = project_point(lat, lon, width, height, min_lat, max_lat, min_lon, max_lon)
+        if previous is not None:
+            draw_line(canvas, styles, previous, (x, y), "#", "dim")
+        previous = (x, y)
+
+
+def draw_line(
+    canvas: list[list[str]],
+    styles: list[list[str]],
+    start: tuple[int, int],
+    end: tuple[int, int],
+    char: str,
+    style: str,
+) -> None:
+    start_x, start_y = start
+    end_x, end_y = end
+    steps = max(abs(end_x - start_x), abs(end_y - start_y), 1)
+    for step in range(steps + 1):
+        x = round(start_x + (end_x - start_x) * (step / steps))
+        y = round(start_y + (end_y - start_y) * (step / steps))
+        canvas[y][x] = char
+        styles[y][x] = style
+
+
+def point_in_boundary_polygon(
+    point: tuple[float, float],
+    polygon: BoundaryPolygon,
+) -> bool:
+    if not point_in_ring(point, polygon.outer):
+        return False
+    return not any(point_in_ring(point, hole) for hole in polygon.holes)
+
+
+def point_in_ring(point: tuple[float, float], ring: list[tuple[float, float]]) -> bool:
+    x, y = point
+    inside = False
+    previous_x, previous_y = ring[-1]
+    for current_x, current_y in ring:
+        if (current_y > y) != (previous_y > y):
+            intersection_x = (previous_x - current_x) * (y - current_y) / (
+                previous_y - current_y
+            ) + current_x
+            if x < intersection_x:
+                inside = not inside
+        previous_x, previous_y = current_x, current_y
+    return inside
 
 
 def draw_station_footprint(

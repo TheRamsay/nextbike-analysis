@@ -61,6 +61,7 @@ uv run nextbike nearest --address "Moravské náměstí, Brno" --refresh
 uv run nextbike nearest --whereami
 uv run nextbike dashboard
 uv run nextbike dashboard --once --width 100 --height 30
+uv run nextbike dashboard --background footprint
 uv run nextbike dashboard --background none
 ```
 
@@ -74,3 +75,6 @@ The feed URL is configurable:
 ```bash
 uv run nextbike info --gbfs-url https://gbfs.nextbike.net/maps/gbfs/v2/nextbike_te/gbfs.json
 ```
+
+The dashboard caches the Brno city boundary from OpenStreetMap/Nominatim in `data/cache/`
+and shows the required OpenStreetMap attribution in the terminal.

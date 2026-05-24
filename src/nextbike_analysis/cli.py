@@ -15,6 +15,7 @@ from rich.live import Live
 from rich.console import Console
 from rich.table import Table
 
+from nextbike_analysis.boundary import load_brno_boundary
 from nextbike_analysis.config import Settings
 from nextbike_analysis.dashboard import load_dashboard_data, render_dashboard
 from nextbike_analysis.db import LATEST_STATION_INFO_SQL, connect_db
@@ -954,14 +955,15 @@ def nearest(
 @app.command()
 def dashboard(
     db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+    data_dir: Annotated[Path | None, typer.Option(help="Directory for cached map data.")] = None,
     width: Annotated[int | None, typer.Option(help="Map width in terminal columns.")] = None,
     height: Annotated[int | None, typer.Option(help="Map height in terminal rows.")] = None,
     refresh_seconds: Annotated[float, typer.Option(help="Refresh interval for live mode.")] = 10.0,
     include_empty: Annotated[bool, typer.Option(help="Show empty stations too.")] = True,
     background: Annotated[
         str,
-        typer.Option(help="Map background: footprint or none."),
-    ] = "footprint",
+        typer.Option(help="Map background: osm, footprint, or none."),
+    ] = "osm",
     once: Annotated[bool, typer.Option(help="Render once and exit.")] = False,
 ) -> None:
     """Show a live ASCII map dashboard for the latest Brno station snapshot."""
@@ -971,17 +973,25 @@ def dashboard(
         raise typer.BadParameter("height must be at least 8")
     if refresh_seconds <= 0:
         raise typer.BadParameter("refresh_seconds must be positive")
-    if background not in {"footprint", "none"}:
-        raise typer.BadParameter("background must be either 'footprint' or 'none'")
+    if background not in {"osm", "footprint", "none"}:
+        raise typer.BadParameter("background must be one of: osm, footprint, none")
 
-    settings = make_settings(None, None, db_path)
+    settings = make_settings(None, data_dir, db_path)
+    boundary = None
+    effective_background = background
+    if background == "osm":
+        try:
+            boundary = load_brno_boundary(settings.data_dir, settings.request_timeout_seconds)
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[yellow]OSM boundary unavailable, using station footprint:[/yellow] {exc}")
+            effective_background = "footprint"
 
     def render_current() -> object:
         console_width, console_height = console.size
         map_width = width or max(20, min(120, console_width - 2))
         map_height = height or max(8, min(36, console_height - 5))
         data = load_dashboard_data(settings.db_path, include_empty)
-        return render_dashboard(data, map_width, map_height, background)
+        return render_dashboard(data, map_width, map_height, effective_background, boundary)
 
     if once:
         console.print(render_current())
