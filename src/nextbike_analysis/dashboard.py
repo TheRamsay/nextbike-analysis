@@ -107,8 +107,8 @@ def load_dashboard_data(db_path: Path, include_empty: bool) -> DashboardData:
     )
 
 
-def render_dashboard(data: DashboardData, width: int, height: int) -> Group:
-    map_text = render_ascii_map(data.points, width, height)
+def render_dashboard(data: DashboardData, width: int, height: int, background: str) -> Group:
+    map_text = render_ascii_map(data.points, width, height, background)
     title = Text.assemble(
         ("Nextbike Brno dashboard", "bold"),
         ("  latest: ", "dim"),
@@ -118,42 +118,51 @@ def render_dashboard(data: DashboardData, width: int, height: int) -> Group:
         f"stations: {data.station_count} | shown: {len(data.points)} | "
         f"empty: {data.empty_stations} | bikes available: {data.bikes_available}"
     )
-    legend = Text.assemble(
+    legend_parts: list[str | tuple[str, str]] = [
         (".", "blue"),
         " with bikes  ",
         (".", "dim"),
         " empty  ",
         ("*", "bright_blue"),
         " multiple  ",
+    ]
+    if background == "footprint":
+        legend_parts.extend([(":,", "dim"), " footprint  "])
+    legend_parts.append(
         ("Ctrl+C to quit", "dim"),
     )
+    legend = Text.assemble(*legend_parts)
     return Group(title, stats, legend, map_text)
 
 
-def render_ascii_map(points: list[DashboardPoint], width: int, height: int) -> Text:
+def render_ascii_map(
+    points: list[DashboardPoint],
+    width: int,
+    height: int,
+    background: str,
+) -> Text:
     inner_width = max(width - 2, 10)
     inner_height = max(height - 2, 5)
     canvas = [[" " for _ in range(inner_width)] for _ in range(inner_height)]
     styles = [["" for _ in range(inner_width)] for _ in range(inner_height)]
 
     if points:
-        min_lat = min(point.lat for point in points)
-        max_lat = max(point.lat for point in points)
-        min_lon = min(point.lon for point in points)
-        max_lon = max(point.lon for point in points)
-        lat_padding = max((max_lat - min_lat) * 0.08, 0.001)
-        lon_padding = max((max_lon - min_lon) * 0.08, 0.001)
-        min_lat -= lat_padding
-        max_lat += lat_padding
-        min_lon -= lon_padding
-        max_lon += lon_padding
+        min_lat, max_lat, min_lon, max_lon = padded_bounds(points)
+        if background == "footprint":
+            draw_station_footprint(canvas, styles, points, min_lat, max_lat, min_lon, max_lon)
 
         for point in points:
-            x_ratio = (point.lon - min_lon) / (max_lon - min_lon)
-            y_ratio = (max_lat - point.lat) / (max_lat - min_lat)
-            x = min(inner_width - 1, max(0, round(x_ratio * (inner_width - 1))))
-            y = min(inner_height - 1, max(0, round(y_ratio * (inner_height - 1))))
-            if canvas[y][x] != " ":
+            x, y = project_point(
+                point.lat,
+                point.lon,
+                inner_width,
+                inner_height,
+                min_lat,
+                max_lat,
+                min_lon,
+                max_lon,
+            )
+            if canvas[y][x] in {".", "*"}:
                 canvas[y][x] = "*"
                 styles[y][x] = "bright_blue"
             elif point.bikes > 0:
@@ -172,3 +181,85 @@ def render_ascii_map(points: list[DashboardPoint], width: int, height: int) -> T
         text.append("|\n", style="dim")
     text.append("+" + "-" * inner_width + "+", style="dim")
     return text
+
+
+def padded_bounds(points: list[DashboardPoint]) -> tuple[float, float, float, float]:
+    min_lat = min(point.lat for point in points)
+    max_lat = max(point.lat for point in points)
+    min_lon = min(point.lon for point in points)
+    max_lon = max(point.lon for point in points)
+    lat_padding = max((max_lat - min_lat) * 0.08, 0.001)
+    lon_padding = max((max_lon - min_lon) * 0.08, 0.001)
+    return (
+        min_lat - lat_padding,
+        max_lat + lat_padding,
+        min_lon - lon_padding,
+        max_lon + lon_padding,
+    )
+
+
+def project_point(
+    lat: float,
+    lon: float,
+    width: int,
+    height: int,
+    min_lat: float,
+    max_lat: float,
+    min_lon: float,
+    max_lon: float,
+) -> tuple[int, int]:
+    x_ratio = (lon - min_lon) / (max_lon - min_lon)
+    y_ratio = (max_lat - lat) / (max_lat - min_lat)
+    x = min(width - 1, max(0, round(x_ratio * (width - 1))))
+    y = min(height - 1, max(0, round(y_ratio * (height - 1))))
+    return x, y
+
+
+def draw_station_footprint(
+    canvas: list[list[str]],
+    styles: list[list[str]],
+    points: list[DashboardPoint],
+    min_lat: float,
+    max_lat: float,
+    min_lon: float,
+    max_lon: float,
+) -> None:
+    height = len(canvas)
+    width = len(canvas[0])
+    if not points:
+        return
+
+    projected_points = [
+        project_point_float(point.lat, point.lon, width, height, min_lat, max_lat, min_lon, max_lon)
+        for point in points
+    ]
+    radius = max(2.4, min(width, height) * 0.14)
+    soft_edge = radius + 1.7
+
+    for y in range(height):
+        for x in range(width):
+            distance = min(
+                ((x - point_x) ** 2 + (y - point_y) ** 2) ** 0.5
+                for point_x, point_y in projected_points
+            )
+            if distance <= radius:
+                canvas[y][x] = ":"
+                styles[y][x] = "dim"
+            elif distance <= soft_edge:
+                canvas[y][x] = ","
+                styles[y][x] = "dim"
+
+
+def project_point_float(
+    lat: float,
+    lon: float,
+    width: int,
+    height: int,
+    min_lat: float,
+    max_lat: float,
+    min_lon: float,
+    max_lon: float,
+) -> tuple[float, float]:
+    x_ratio = (lon - min_lon) / (max_lon - min_lon)
+    y_ratio = (max_lat - lat) / (max_lat - min_lat)
+    return x_ratio * (width - 1), y_ratio * (height - 1)

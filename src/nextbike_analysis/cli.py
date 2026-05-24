@@ -958,6 +958,10 @@ def dashboard(
     height: Annotated[int | None, typer.Option(help="Map height in terminal rows.")] = None,
     refresh_seconds: Annotated[float, typer.Option(help="Refresh interval for live mode.")] = 10.0,
     include_empty: Annotated[bool, typer.Option(help="Show empty stations too.")] = True,
+    background: Annotated[
+        str,
+        typer.Option(help="Map background: footprint or none."),
+    ] = "footprint",
     once: Annotated[bool, typer.Option(help="Render once and exit.")] = False,
 ) -> None:
     """Show a live ASCII map dashboard for the latest Brno station snapshot."""
@@ -967,6 +971,8 @@ def dashboard(
         raise typer.BadParameter("height must be at least 8")
     if refresh_seconds <= 0:
         raise typer.BadParameter("refresh_seconds must be positive")
+    if background not in {"footprint", "none"}:
+        raise typer.BadParameter("background must be either 'footprint' or 'none'")
 
     settings = make_settings(None, None, db_path)
 
@@ -975,7 +981,7 @@ def dashboard(
         map_width = width or max(20, min(120, console_width - 2))
         map_height = height or max(8, min(36, console_height - 5))
         data = load_dashboard_data(settings.db_path, include_empty)
-        return render_dashboard(data, map_width, map_height)
+        return render_dashboard(data, map_width, map_height, background)
 
     if once:
         console.print(render_current())

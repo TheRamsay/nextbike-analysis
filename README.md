@@ -61,6 +61,7 @@ uv run nextbike nearest --address "Moravské náměstí, Brno" --refresh
 uv run nextbike nearest --whereami
 uv run nextbike dashboard
 uv run nextbike dashboard --once --width 100 --height 30
+uv run nextbike dashboard --background none
 ```
 
 By default data is written to:
