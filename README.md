@@ -37,8 +37,9 @@ uv run nextbike poll --interval-seconds 60 --no-include-free-bikes
 Run it in the background:
 
 ```bash
-nohup .venv/bin/nextbike poll --interval-seconds 60 --no-include-free-bikes >> data/poller.log 2>&1 &
-echo $! > data/poller.pid
+uv run nextbike poller-start
+uv run nextbike poller-status
+uv run nextbike poller-stop
 ```
 
 Inspect the local database:

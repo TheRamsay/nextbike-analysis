@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
+import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -36,6 +41,35 @@ def connect_db(db_path: Path) -> duckdb.DuckDBPyConnection:
     if not db_path.exists():
         raise typer.BadParameter(f"Database does not exist: {db_path}")
     return duckdb.connect(str(db_path), read_only=True)
+
+
+def pid_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def read_pid(pid_path: Path) -> int | None:
+    if not pid_path.exists():
+        return None
+    try:
+        return int(pid_path.read_text(encoding="utf-8").strip())
+    except ValueError:
+        return None
+
+
+def tail_lines(path: Path, line_count: int = 5) -> list[str]:
+    if not path.exists():
+        return []
+    return path.read_text(encoding="utf-8", errors="replace").splitlines()[-line_count:]
+
+
+def poller_paths(data_dir: Path) -> tuple[Path, Path]:
+    return data_dir / "poller.pid", data_dir / "poller.log"
 
 
 LATEST_STATION_INFO_SQL = """
@@ -209,6 +243,173 @@ def poll(
         if max_samples is not None and sample >= max_samples:
             break
         time.sleep(interval_seconds)
+
+
+@app.command("poller-start")
+def poller_start(
+    gbfs_url: Annotated[str | None, typer.Option(help="GBFS discovery URL.")] = None,
+    data_dir: Annotated[Path | None, typer.Option(help="Directory for raw data.")] = None,
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+    language: Annotated[str, typer.Option(help="GBFS language key.")] = "en",
+    interval_seconds: Annotated[int, typer.Option(help="Delay between snapshots.")] = 60,
+    include_free_bikes: Annotated[
+        bool,
+        typer.Option(help="Store free_bike_status raw snapshots and aggregate counts."),
+    ] = False,
+    force: Annotated[bool, typer.Option(help="Replace a stale PID file if present.")] = False,
+) -> None:
+    """Start the GBFS poller as a background process."""
+    if interval_seconds <= 0:
+        raise typer.BadParameter("interval_seconds must be positive")
+
+    settings = make_settings(gbfs_url, data_dir, db_path)
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    pid_path, log_path = poller_paths(settings.data_dir)
+
+    existing_pid = read_pid(pid_path)
+    if existing_pid is not None and pid_is_running(existing_pid):
+        console.print(f"[yellow]poller already running[/yellow] pid={existing_pid}")
+        raise typer.Exit(code=0)
+    if existing_pid is not None and not force:
+        console.print(f"[red]stale PID file exists[/red] pid={existing_pid} path={pid_path}")
+        console.print("Run with --force to replace it.")
+        raise typer.Exit(code=1)
+
+    command = [
+        sys.argv[0],
+        "poll",
+        "--gbfs-url",
+        settings.gbfs_url,
+        "--data-dir",
+        str(settings.data_dir),
+        "--db-path",
+        str(settings.db_path),
+        "--language",
+        language,
+        "--interval-seconds",
+        str(interval_seconds),
+        "--include-free-bikes" if include_free_bikes else "--no-include-free-bikes",
+    ]
+    with log_path.open("ab") as log_file:
+        process = subprocess.Popen(
+            command,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            cwd=Path.cwd(),
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+
+    pid_path.write_text(f"{process.pid}\n", encoding="utf-8")
+    console.print(
+        "[green]poller started[/green] "
+        f"pid={process.pid} interval_seconds={interval_seconds} log={log_path}"
+    )
+
+
+@app.command("poller-stop")
+def poller_stop(
+    data_dir: Annotated[Path | None, typer.Option(help="Directory containing poller.pid.")] = None,
+    timeout_seconds: Annotated[float, typer.Option(help="Seconds to wait after SIGTERM.")] = 10.0,
+    force: Annotated[bool, typer.Option(help="Send SIGKILL if SIGTERM does not stop it.")] = False,
+) -> None:
+    """Stop the background GBFS poller."""
+    if timeout_seconds <= 0:
+        raise typer.BadParameter("timeout_seconds must be positive")
+
+    settings = make_settings(None, data_dir, None)
+    pid_path, _ = poller_paths(settings.data_dir)
+    pid = read_pid(pid_path)
+    if pid is None:
+        console.print("[yellow]poller PID file not found or invalid[/yellow]")
+        return
+    if not pid_is_running(pid):
+        pid_path.unlink(missing_ok=True)
+        console.print(f"[yellow]removed stale poller PID[/yellow] pid={pid}")
+        return
+
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if not pid_is_running(pid):
+            pid_path.unlink(missing_ok=True)
+            console.print(f"[green]poller stopped[/green] pid={pid}")
+            return
+        time.sleep(0.2)
+
+    if force:
+        os.kill(pid, signal.SIGKILL)
+        pid_path.unlink(missing_ok=True)
+        console.print(f"[green]poller killed[/green] pid={pid}")
+        return
+
+    console.print(f"[red]poller did not stop within {timeout_seconds}s[/red] pid={pid}")
+    console.print("Run with --force to send SIGKILL.")
+    raise typer.Exit(code=1)
+
+
+@app.command("poller-status")
+def poller_status(
+    data_dir: Annotated[Path | None, typer.Option(help="Directory containing poller files.")] = None,
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+    log_lines: Annotated[int, typer.Option(help="Number of poller log lines to show.")] = 5,
+) -> None:
+    """Show background poller process, log, and latest collection status."""
+    if log_lines < 0:
+        raise typer.BadParameter("log_lines cannot be negative")
+
+    settings = make_settings(None, data_dir, db_path)
+    pid_path, log_path = poller_paths(settings.data_dir)
+    pid = read_pid(pid_path)
+    running = pid is not None and pid_is_running(pid)
+
+    latest_row = None
+    seconds_since_latest = None
+    db_error = None
+    if settings.db_path.exists():
+        try:
+            with duckdb.connect(str(settings.db_path), read_only=True) as con:
+                latest_row = con.sql(
+                    """
+                    select collected_at, station_count, bikes_available, free_bike_count
+                    from collection_runs
+                    order by collected_at desc
+                    limit 1
+                    """
+                ).fetchone()
+        except duckdb.IOException as exc:
+            db_error = str(exc).splitlines()[0]
+        if latest_row is not None:
+            collected_at = latest_row[0]
+            if collected_at.tzinfo is None:
+                collected_at = collected_at.replace(tzinfo=UTC)
+            seconds_since_latest = int((datetime.now(collected_at.tzinfo) - collected_at).total_seconds())
+
+    table = Table(title="Poller status")
+    table.add_column("Metric")
+    table.add_column("Value")
+    table.add_row("pid", str(pid) if pid is not None else "none")
+    table.add_row("running", "yes" if running else "no")
+    table.add_row("pid path", str(pid_path))
+    table.add_row("log path", str(log_path))
+    table.add_row("db path", str(settings.db_path))
+    if db_error is not None:
+        table.add_row("db status", f"busy: {db_error}")
+    if latest_row is not None:
+        table.add_row("latest collected", str(latest_row[0]))
+        table.add_row("seconds since latest", str(seconds_since_latest))
+        table.add_row("latest station count", str(latest_row[1]))
+        table.add_row("latest bikes available", str(latest_row[2]))
+        table.add_row("latest free bike rows", str(latest_row[3]))
+    else:
+        table.add_row("latest collected", "none")
+    console.print(table)
+
+    lines = tail_lines(log_path, log_lines)
+    if lines:
+        console.print("[dim]Recent poller log:[/dim]")
+        for line in lines:
+            console.print(line)
 
 
 @app.command("db-stats")
