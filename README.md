@@ -28,6 +28,19 @@ Poll continuously every minute:
 uv run nextbike poll --interval-seconds 60
 ```
 
+Prefer station-level collection without per-bike rows for long-running local polling:
+
+```bash
+uv run nextbike poll --interval-seconds 60 --no-include-free-bikes
+```
+
+Run it in the background:
+
+```bash
+nohup .venv/bin/nextbike poll --interval-seconds 60 --no-include-free-bikes >> data/poller.log 2>&1 &
+echo $! > data/poller.pid
+```
+
 By default data is written to:
 
 - raw JSON snapshots: `data/raw/`
