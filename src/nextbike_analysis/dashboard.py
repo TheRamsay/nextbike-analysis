@@ -138,7 +138,7 @@ def render_dashboard(
     elif background == "footprint":
         legend_parts.extend([(":,", "dim"), " footprint  "])
     legend_parts.append(
-        ("Ctrl+C to quit", "dim"),
+        ("q/Ctrl+C to quit", "dim"),
     )
     legend = Text.assemble(*legend_parts)
     if background == "osm" and boundary is not None:

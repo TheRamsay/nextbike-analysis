@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import os
+import select
 import signal
 import subprocess
 import sys
+import termios
 import time
+import tty
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
@@ -28,6 +32,30 @@ from nextbike_analysis.storage import SnapshotStore, utc_now
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
+
+
+@contextmanager
+def cbreak_stdin() -> object:
+    if not sys.stdin.isatty():
+        yield
+        return
+
+    fd = sys.stdin.fileno()
+    previous_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, previous_settings)
+
+
+def read_keypress() -> str | None:
+    if not sys.stdin.isatty():
+        return None
+    readable, _, _ = select.select([sys.stdin], [], [], 0)
+    if not readable:
+        return None
+    return sys.stdin.read(1)
 
 
 def make_settings(
@@ -998,9 +1026,16 @@ def dashboard(
         return
 
     try:
-        with Live(render_current(), console=console, screen=True, refresh_per_second=4) as live:
-            while True:
-                time.sleep(refresh_seconds)
-                live.update(render_current())
+        with cbreak_stdin():
+            with Live(render_current(), console=console, screen=True, refresh_per_second=4) as live:
+                next_refresh = time.monotonic() + refresh_seconds
+                while True:
+                    key = read_keypress()
+                    if key in {"q", "Q"}:
+                        break
+                    if time.monotonic() >= next_refresh:
+                        live.update(render_current())
+                        next_refresh = time.monotonic() + refresh_seconds
+                    time.sleep(0.1)
     except KeyboardInterrupt:
         console.print("[dim]dashboard stopped[/dim]")
