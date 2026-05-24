@@ -22,6 +22,7 @@ from rich.table import Table
 from nextbike_analysis.boundary import load_brno_boundary
 from nextbike_analysis.config import Settings
 from nextbike_analysis.dashboard import load_dashboard_data, render_dashboard
+from nextbike_analysis.datasets import build_station_availability_dataset
 from nextbike_analysis.db import LATEST_STATION_INFO_SQL, connect_db
 from nextbike_analysis.formatting import bike_risk, tail_lines
 from nextbike_analysis.geo import get_address_location, get_ip_location
@@ -457,6 +458,68 @@ def latest(
     )
     for label, value in zip(labels, row, strict=True):
         table.add_row(label, str(value))
+    console.print(table)
+
+
+@app.command("build-dataset")
+def build_dataset(
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+    table_name: Annotated[
+        str,
+        typer.Option(help="Output table name for the materialized training dataset."),
+    ] = "training_station_availability",
+    horizon_minutes: Annotated[
+        int,
+        typer.Option(help="Prediction target horizon in minutes."),
+    ] = 30,
+    max_target_delay_minutes: Annotated[
+        int | None,
+        typer.Option(
+            help="Maximum accepted target delay. Defaults to horizon + 10 minutes.",
+        ),
+    ] = None,
+    lag_tolerance_minutes: Annotated[
+        int,
+        typer.Option(help="Extra minutes tolerated when looking up 5m/15m lag features."),
+    ] = 10,
+) -> None:
+    """Build a station-level training table for future bike availability."""
+    if horizon_minutes <= 0:
+        raise typer.BadParameter("horizon_minutes must be positive")
+    if max_target_delay_minutes is None:
+        max_target_delay_minutes = horizon_minutes + 10
+    if max_target_delay_minutes < horizon_minutes:
+        raise typer.BadParameter("max_target_delay_minutes must be >= horizon_minutes")
+    if lag_tolerance_minutes < 0:
+        raise typer.BadParameter("lag_tolerance_minutes cannot be negative")
+
+    settings = make_settings(None, None, db_path)
+    try:
+        result = build_station_availability_dataset(
+            db_path=settings.db_path,
+            table_name=table_name,
+            horizon_minutes=horizon_minutes,
+            max_target_delay_minutes=max_target_delay_minutes,
+            lag_tolerance_minutes=lag_tolerance_minutes,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    table = Table(title=f"Dataset built: {result.table_name}")
+    table.add_column("Metric")
+    table.add_column("Value")
+    table.add_row("horizon minutes", str(result.horizon_minutes))
+    table.add_row("max target delay minutes", str(result.max_target_delay_minutes))
+    table.add_row("lag tolerance minutes", str(result.lag_tolerance_minutes))
+    table.add_row("rows", str(result.rows))
+    table.add_row("stations", str(result.stations))
+    table.add_row("first collected", str(result.first_collected_at))
+    table.add_row("latest collected", str(result.latest_collected_at))
+    table.add_row("null lag 5m rows", str(result.null_lag_5m))
+    table.add_row("null lag 15m rows", str(result.null_lag_15m))
+    table.add_row("future has-bike rate", str(result.positive_rate))
+    table.add_row("future empty rate", str(result.empty_future_rate))
+    table.add_row("avg minutes to target", str(result.avg_minutes_to_target))
     console.print(table)
 
 
