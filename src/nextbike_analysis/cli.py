@@ -404,3 +404,95 @@ def empty_stations(
     for row in rows:
         table.add_row(*(str(value) for value in row))
     console.print(table)
+
+
+@app.command()
+def nearest(
+    lat: Annotated[float, typer.Option(help="Latitude of the search origin.")],
+    lon: Annotated[float, typer.Option(help="Longitude of the search origin.")],
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+    limit: Annotated[int, typer.Option(help="Maximum station rows to show.")] = 10,
+    max_distance_m: Annotated[
+        float | None,
+        typer.Option(help="Only show stations within this distance in meters."),
+    ] = None,
+    include_empty: Annotated[
+        bool,
+        typer.Option(help="Include stations with zero available bikes."),
+    ] = False,
+) -> None:
+    """Show the nearest stations from the latest snapshot."""
+    if not -90 <= lat <= 90:
+        raise typer.BadParameter("lat must be between -90 and 90")
+    if not -180 <= lon <= 180:
+        raise typer.BadParameter("lon must be between -180 and 180")
+    if limit <= 0:
+        raise typer.BadParameter("limit must be positive")
+    if max_distance_m is not None and max_distance_m <= 0:
+        raise typer.BadParameter("max_distance_m must be positive")
+
+    settings = make_settings(None, None, db_path)
+    bike_filter = "" if include_empty else "and s.num_bikes_available > 0"
+    distance_filter = "" if max_distance_m is None else "where distance_m <= ?"
+    params: list[float | int] = [lat, lat, lon]
+    if max_distance_m is not None:
+        params.append(max_distance_m)
+    params.append(limit)
+
+    with connect_db(settings.db_path) as con:
+        rows = con.execute(
+            f"""
+            with latest_run as (
+                select collected_at
+                from collection_runs
+                order by collected_at desc
+                limit 1
+            ),
+            station_info as ({LATEST_STATION_INFO_SQL}),
+            candidates as (
+                select
+                    s.station_id,
+                    coalesce(i.name, s.station_id) as name,
+                    i.region_id,
+                    s.num_bikes_available,
+                    i.lat,
+                    i.lon,
+                    2 * 6371000 * asin(sqrt(
+                        pow(sin(radians(i.lat - ?) / 2), 2)
+                        + cos(radians(?)) * cos(radians(i.lat))
+                        * pow(sin(radians(i.lon - ?) / 2), 2)
+                    )) as distance_m
+                from station_status_snapshots s
+                join latest_run lr using (collected_at)
+                left join station_info i using (station_id)
+                where i.lat is not null
+                    and i.lon is not null
+                    {bike_filter}
+            )
+            select
+                station_id,
+                name,
+                region_id,
+                num_bikes_available,
+                round(distance_m, 0)::integer as distance_m,
+                lat,
+                lon
+            from candidates
+            {distance_filter}
+            order by distance_m, name
+            limit ?
+            """,
+            params,
+        ).fetchall()
+
+    table = Table(title=f"Nearest stations from {lat:.6f}, {lon:.6f}")
+    table.add_column("Station ID")
+    table.add_column("Name")
+    table.add_column("Region")
+    table.add_column("Bikes", justify="right")
+    table.add_column("Distance m", justify="right")
+    table.add_column("Lat", justify="right")
+    table.add_column("Lon", justify="right")
+    for row in rows:
+        table.add_row(*(str(value) for value in row))
+    console.print(table)
