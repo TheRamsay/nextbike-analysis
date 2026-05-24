@@ -11,10 +11,12 @@ from typing import Annotated
 
 import duckdb
 import typer
+from rich.live import Live
 from rich.console import Console
 from rich.table import Table
 
 from nextbike_analysis.config import Settings
+from nextbike_analysis.dashboard import load_dashboard_data, render_dashboard
 from nextbike_analysis.db import LATEST_STATION_INFO_SQL, connect_db
 from nextbike_analysis.formatting import bike_risk, tail_lines
 from nextbike_analysis.geo import get_address_location, get_ip_location
@@ -947,3 +949,42 @@ def nearest(
         )
     console.print(f"[dim]Location source: {location_label}[/dim]")
     console.print(table)
+
+
+@app.command()
+def dashboard(
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+    width: Annotated[int | None, typer.Option(help="Map width in terminal columns.")] = None,
+    height: Annotated[int | None, typer.Option(help="Map height in terminal rows.")] = None,
+    refresh_seconds: Annotated[float, typer.Option(help="Refresh interval for live mode.")] = 10.0,
+    include_empty: Annotated[bool, typer.Option(help="Show empty stations too.")] = True,
+    once: Annotated[bool, typer.Option(help="Render once and exit.")] = False,
+) -> None:
+    """Show a live ASCII map dashboard for the latest Brno station snapshot."""
+    if width is not None and width < 20:
+        raise typer.BadParameter("width must be at least 20")
+    if height is not None and height < 8:
+        raise typer.BadParameter("height must be at least 8")
+    if refresh_seconds <= 0:
+        raise typer.BadParameter("refresh_seconds must be positive")
+
+    settings = make_settings(None, None, db_path)
+
+    def render_current() -> object:
+        console_width, console_height = console.size
+        map_width = width or max(20, min(120, console_width - 2))
+        map_height = height or max(8, min(36, console_height - 5))
+        data = load_dashboard_data(settings.db_path, include_empty)
+        return render_dashboard(data, map_width, map_height)
+
+    if once:
+        console.print(render_current())
+        return
+
+    try:
+        with Live(render_current(), console=console, screen=True, refresh_per_second=4) as live:
+            while True:
+                time.sleep(refresh_seconds)
+                live.update(render_current())
+    except KeyboardInterrupt:
+        console.print("[dim]dashboard stopped[/dim]")
