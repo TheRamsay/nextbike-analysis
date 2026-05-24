@@ -10,13 +10,17 @@ from pathlib import Path
 from typing import Annotated
 
 import duckdb
-import httpx
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from nextbike_analysis.config import Settings
+from nextbike_analysis.db import LATEST_STATION_INFO_SQL, connect_db
+from nextbike_analysis.formatting import bike_risk, tail_lines
+from nextbike_analysis.geo import get_address_location, get_ip_location
 from nextbike_analysis.gbfs import DEFAULT_FEEDS, GbfsClient
+from nextbike_analysis.poller import pid_is_running, poller_paths, read_pid
+from nextbike_analysis.reports import get_data_health, get_system_trend
 from nextbike_analysis.storage import SnapshotStore, utc_now
 
 app = typer.Typer(no_args_is_help=True)
@@ -35,137 +39,6 @@ def make_settings(
         db_path=db_path or defaults.db_path,
         request_timeout_seconds=defaults.request_timeout_seconds,
     )
-
-
-def connect_db(db_path: Path) -> duckdb.DuckDBPyConnection:
-    if not db_path.exists():
-        raise typer.BadParameter(f"Database does not exist: {db_path}")
-    return duckdb.connect(str(db_path), read_only=True)
-
-
-def pid_is_running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def read_pid(pid_path: Path) -> int | None:
-    if not pid_path.exists():
-        return None
-    try:
-        return int(pid_path.read_text(encoding="utf-8").strip())
-    except ValueError:
-        return None
-
-
-def tail_lines(path: Path, line_count: int = 5) -> list[str]:
-    if not path.exists():
-        return []
-    return path.read_text(encoding="utf-8", errors="replace").splitlines()[-line_count:]
-
-
-def poller_paths(data_dir: Path) -> tuple[Path, Path]:
-    return data_dir / "poller.pid", data_dir / "poller.log"
-
-
-def directory_size_bytes(path: Path) -> int:
-    if not path.exists():
-        return 0
-    return sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
-
-
-def bike_risk(num_bikes_available: int) -> str:
-    if num_bikes_available <= 0:
-        return "empty"
-    if num_bikes_available == 1:
-        return "high"
-    if num_bikes_available <= 3:
-        return "medium"
-    return "low"
-
-
-LATEST_STATION_INFO_SQL = """
-select station_id, name, short_name, region_id, lat, lon
-from (
-    select
-        station_id,
-        name,
-        short_name,
-        region_id,
-        lat,
-        lon,
-        row_number() over (partition by station_id order by observed_at desc) as rn
-    from station_information
-)
-where rn = 1
-"""
-
-
-def get_ip_location(timeout_seconds: float) -> tuple[float, float, str]:
-    providers = (
-        (
-            "ipapi.co",
-            "https://ipapi.co/json/",
-            lambda data: (
-                data.get("latitude"),
-                data.get("longitude"),
-                data.get("city"),
-                data.get("country_name"),
-            ),
-        ),
-        (
-            "ipwho.is",
-            "https://ipwho.is/",
-            lambda data: (
-                data.get("latitude"),
-                data.get("longitude"),
-                data.get("city"),
-                data.get("country"),
-            ),
-        ),
-    )
-    errors: list[str] = []
-    with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as client:
-        for provider_name, url, parser in providers:
-            try:
-                response = client.get(url)
-                response.raise_for_status()
-                data = response.json()
-                lat, lon, city, country = parser(data)
-                if lat is None or lon is None:
-                    errors.append(f"{provider_name}: missing latitude/longitude")
-                    continue
-                label = f"{provider_name} approximate location ({city}, {country})"
-                return float(lat), float(lon), label
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{provider_name}: {exc}")
-
-    raise typer.BadParameter("IP geolocation failed: " + "; ".join(errors))
-
-
-def get_address_location(address: str, timeout_seconds: float) -> tuple[float, float, str]:
-    headers = {"User-Agent": "nextbike-analysis/0.1 (local CLI geocoder)"}
-    params = {
-        "q": address,
-        "format": "jsonv2",
-        "limit": 1,
-        "addressdetails": 1,
-    }
-    with httpx.Client(timeout=timeout_seconds, follow_redirects=True, headers=headers) as client:
-        response = client.get("https://nominatim.openstreetmap.org/search", params=params)
-        response.raise_for_status()
-        results = response.json()
-
-    if not results:
-        raise typer.BadParameter(f"Address not found: {address}")
-
-    result = results[0]
-    display_name = result.get("display_name", address)
-    return float(result["lat"]), float(result["lon"]), f"Nominatim address match ({display_name})"
 
 
 @app.command()
@@ -585,148 +458,71 @@ def data_health(
         raise typer.BadParameter("since_hours must be positive")
 
     settings = make_settings(None, data_dir, db_path)
-    time_filter = ""
-    params: list[float | int] = []
-    if since_hours is not None:
-        time_filter = "where collected_at >= now() - (? * interval '1 hour')"
-        params.append(since_hours)
-
-    with connect_db(settings.db_path) as con:
-        summary = con.execute(
-            f"""
-            select
-                count(*) as runs,
-                min(collected_at) as first_collected_at,
-                max(collected_at) as latest_collected_at,
-                min(station_count) as min_station_count,
-                max(station_count) as max_station_count,
-                round(avg(station_count), 2) as avg_station_count,
-                min(bikes_available) as min_bikes_available,
-                max(bikes_available) as max_bikes_available,
-                round(avg(bikes_available), 2) as avg_bikes_available,
-                count(*) - count(distinct collected_at) as duplicate_collected_at
-            from collection_runs
-            {time_filter}
-            """,
-            params,
-        ).fetchone()
-        station_rows = con.execute(
-            f"""
-            select count(*)
-            from station_status_snapshots
-            {time_filter}
-            """,
-            params,
-        ).fetchone()[0]
-        try:
-            free_bike_rows = con.execute(
-                f"""
-                select count(*)
-                from free_bike_status_snapshots
-                {time_filter}
-                """,
-                params,
-            ).fetchone()[0]
-        except duckdb.CatalogException:
-            free_bike_rows = None
-        distinct_stations = con.execute(
-            f"""
-            select count(distinct station_id)
-            from station_status_snapshots
-            {time_filter}
-            """,
-            params,
-        ).fetchone()[0]
-        gap_summary = con.execute(
-            f"""
-            with ordered as (
-                select
-                    collected_at,
-                    lag(collected_at) over (order by collected_at) as previous_collected_at
-                from collection_runs
-                {time_filter}
-            ),
-            gaps as (
-                select
-                    previous_collected_at,
-                    collected_at,
-                    date_diff('second', previous_collected_at, collected_at) as gap_seconds
-                from ordered
-                where previous_collected_at is not null
-            )
-            select
-                count_if(gap_seconds > ?) as gap_count,
-                max(gap_seconds) as max_gap_seconds,
-                round(avg(gap_seconds), 2) as avg_interval_seconds,
-                min(gap_seconds) as min_interval_seconds
-            from gaps
-            """,
-            [*params, gap_threshold_seconds],
-        ).fetchone()
-        gaps = con.execute(
-            f"""
-            with ordered as (
-                select
-                    collected_at,
-                    lag(collected_at) over (order by collected_at) as previous_collected_at
-                from collection_runs
-                {time_filter}
-            )
-            select
-                previous_collected_at,
-                collected_at,
-                date_diff('second', previous_collected_at, collected_at) as gap_seconds
-            from ordered
-            where previous_collected_at is not null
-                and date_diff('second', previous_collected_at, collected_at) > ?
-            order by gap_seconds desc, collected_at desc
-            limit ?
-            """,
-            [*params, gap_threshold_seconds, max_gaps],
-        ).fetchall()
-
-    runs = summary[0] or 0
-    first_collected_at = summary[1]
-    latest_collected_at = summary[2]
-    expected_samples = None
-    coverage_pct = None
-    if first_collected_at is not None and latest_collected_at is not None:
-        elapsed_seconds = (latest_collected_at - first_collected_at).total_seconds()
-        expected_samples = int(elapsed_seconds // expected_interval_seconds) + 1
-        coverage_pct = round((runs / expected_samples) * 100, 2) if expected_samples else None
-
-    db_size = settings.db_path.stat().st_size if settings.db_path.exists() else 0
-    raw_size = directory_size_bytes(settings.data_dir / "raw")
+    health = get_data_health(
+        db_path=settings.db_path,
+        data_dir=settings.data_dir,
+        expected_interval_seconds=expected_interval_seconds,
+        gap_threshold_seconds=gap_threshold_seconds,
+        max_gaps=max_gaps,
+        since_hours=since_hours,
+    )
 
     table = Table(title="Data health")
     table.add_column("Metric")
     table.add_column("Value")
-    table.add_row("collection runs", str(runs))
-    table.add_row("window", f"last {since_hours}h" if since_hours is not None else "all")
-    table.add_row("expected samples", str(expected_samples))
-    table.add_row("coverage pct", str(coverage_pct))
-    table.add_row("first collected", str(first_collected_at))
-    table.add_row("latest collected", str(latest_collected_at))
-    table.add_row("station rows", str(station_rows))
-    table.add_row("free bike rows", str(free_bike_rows) if free_bike_rows is not None else "not initialized")
-    table.add_row("distinct stations", str(distinct_stations))
-    table.add_row("station count min/avg/max", f"{summary[3]}/{summary[5]}/{summary[4]}")
-    table.add_row("bikes available min/avg/max", f"{summary[6]}/{summary[8]}/{summary[7]}")
-    table.add_row("duplicate collected_at", str(summary[9]))
-    table.add_row("gap count", str(gap_summary[0] or 0))
-    table.add_row("interval min/avg/max seconds", f"{gap_summary[3]}/{gap_summary[2]}/{gap_summary[1]}")
-    table.add_row("db size MB", f"{db_size / 1024 / 1024:.2f}")
-    table.add_row("raw size MB", f"{raw_size / 1024 / 1024:.2f}")
+    table.add_row("collection runs", str(health.runs))
+    table.add_row("window", health.window)
+    table.add_row("expected samples", str(health.expected_samples))
+    table.add_row("coverage pct", str(health.coverage_pct))
+    table.add_row("first collected", str(health.first_collected_at))
+    table.add_row("latest collected", str(health.latest_collected_at))
+    table.add_row("station rows", str(health.station_rows))
+    table.add_row(
+        "free bike rows",
+        str(health.free_bike_rows) if health.free_bike_rows is not None else "not initialized",
+    )
+    table.add_row("distinct stations", str(health.distinct_stations))
+    table.add_row("station count min/avg/max", health.station_count_min_avg_max)
+    table.add_row("bikes available min/avg/max", health.bikes_available_min_avg_max)
+    table.add_row("duplicate collected_at", str(health.duplicate_collected_at))
+    table.add_row("gap count", str(health.gap_count))
+    table.add_row("interval min/avg/max seconds", health.interval_min_avg_max_seconds)
+    table.add_row("db size MB", f"{health.db_size_mb:.2f}")
+    table.add_row("raw size MB", f"{health.raw_size_mb:.2f}")
     console.print(table)
 
-    if gaps:
+    if health.gaps:
         gap_table = Table(title=f"Largest gaps > {gap_threshold_seconds}s")
         gap_table.add_column("Previous")
         gap_table.add_column("Next")
         gap_table.add_column("Gap seconds", justify="right")
-        for row in gaps:
+        for row in health.gaps:
             gap_table.add_row(str(row[0]), str(row[1]), str(row[2]))
         console.print(gap_table)
+
+
+@app.command("system-trend")
+def system_trend(
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+    limit: Annotated[int, typer.Option(help="Number of recent snapshots to show.")] = 20,
+) -> None:
+    """Show recent system-wide availability trend."""
+    if limit <= 0:
+        raise typer.BadParameter("limit must be positive")
+
+    settings = make_settings(None, None, db_path)
+    rows = get_system_trend(settings.db_path, limit)
+
+    table = Table(title=f"System trend ({len(rows)} snapshots)")
+    table.add_column("Collected at")
+    table.add_column("Bikes", justify="right")
+    table.add_column("Free bike rows", justify="right")
+    table.add_column("Empty stations", justify="right")
+    table.add_column("Avg bikes/station", justify="right")
+    table.add_column("Max bikes/station", justify="right")
+    for row in reversed(rows):
+        table.add_row(*(str(value) for value in row))
+    console.print(table)
 
 
 @app.command("top-stations")
