@@ -72,6 +72,16 @@ def poller_paths(data_dir: Path) -> tuple[Path, Path]:
     return data_dir / "poller.pid", data_dir / "poller.log"
 
 
+def bike_risk(num_bikes_available: int) -> str:
+    if num_bikes_available <= 0:
+        return "empty"
+    if num_bikes_available == 1:
+        return "high"
+    if num_bikes_available <= 3:
+        return "medium"
+    return "low"
+
+
 LATEST_STATION_INFO_SQL = """
 select station_id, name, short_name, region_id, lat, lon
 from (
@@ -690,6 +700,10 @@ def nearest(
         bool,
         typer.Option(help="Use approximate IP-based geolocation for the search origin."),
     ] = False,
+    refresh: Annotated[
+        bool,
+        typer.Option(help="Collect a fresh station-level snapshot before searching."),
+    ] = False,
 ) -> None:
     """Show the nearest stations from the latest snapshot."""
     location_label = "manual"
@@ -719,6 +733,14 @@ def nearest(
         raise typer.BadParameter("limit must be positive")
     if max_distance_m is not None and max_distance_m <= 0:
         raise typer.BadParameter("max_distance_m must be positive")
+
+    if refresh:
+        metrics = collect_once(settings, language="en", include_free_bikes=False)
+        console.print(
+            "[green]refreshed[/green] "
+            f"stations={metrics['station_count']} "
+            f"bikes_available={metrics['bikes_available']}"
+        )
 
     bike_filter = "" if include_empty else "and s.num_bikes_available > 0"
     distance_filter = "" if max_distance_m is None else "where distance_m <= ?"
@@ -778,10 +800,21 @@ def nearest(
     table.add_column("Name")
     table.add_column("Region")
     table.add_column("Bikes", justify="right")
+    table.add_column("Risk")
     table.add_column("Distance m", justify="right")
     table.add_column("Lat", justify="right")
     table.add_column("Lon", justify="right")
     for row in rows:
-        table.add_row(*(str(value) for value in row))
+        station_id, name, region_id, bikes, distance_m, station_lat, station_lon = row
+        table.add_row(
+            str(station_id),
+            str(name),
+            str(region_id),
+            str(bikes),
+            bike_risk(int(bikes)),
+            str(distance_m),
+            str(station_lat),
+            str(station_lon),
+        )
     console.print(f"[dim]Location source: {location_label}[/dim]")
     console.print(table)
