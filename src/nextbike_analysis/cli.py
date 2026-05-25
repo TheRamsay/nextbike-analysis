@@ -20,6 +20,12 @@ from rich.console import Console
 from rich.table import Table
 
 from nextbike_analysis.boundary import load_brno_boundary
+from nextbike_analysis.citybikes import (
+    area_history,
+    download_network_files,
+    list_network_files,
+    summarize_network_history,
+)
 from nextbike_analysis.config import Settings
 from nextbike_analysis.dashboard import load_dashboard_data, render_dashboard
 from nextbike_analysis.datasets import build_station_availability_dataset
@@ -175,6 +181,25 @@ def format_distance(meters: object) -> str:
     if distance_m < 1000:
         return f"{distance_m}m"
     return f"{distance_m / 1000:.1f}km"
+
+
+def format_percent(value: object) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value) * 100:.1f}%"
+
+
+def format_bytes(size: object) -> str:
+    if size is None:
+        return "n/a"
+    size_float = float(size)
+    for suffix in ("B", "kB", "MB", "GB"):
+        if size_float < 1000 or suffix == "GB":
+            if suffix == "B":
+                return f"{int(size_float)} {suffix}"
+            return f"{size_float:.1f} {suffix}"
+        size_float /= 1000
+    return f"{size_float:.1f} GB"
 
 
 def short_bike_id(bike_id: object) -> str:
@@ -2461,6 +2486,245 @@ def station_departures(
             format_distance(move_distance_m),
         )
     console.print(detail_table)
+
+
+@app.command("citybikes-files")
+def citybikes_files(
+    network: Annotated[str, typer.Option(help="CityBikes network slug.")] = "nextbike-brno",
+    year: Annotated[list[int] | None, typer.Option(help="Limit to one or more years.")] = None,
+) -> None:
+    """List CityBikes monthly parquet files for a network."""
+    files = list_network_files(network, years=year)
+    table = Table(title=f"CityBikes files for {network}")
+    table.add_column("Name")
+    table.add_column("Year", justify="right")
+    table.add_column("Size", justify="right")
+    table.add_column("Modified")
+    for file in files:
+        table.add_row(file.name, str(file.year), format_bytes(file.size), file.mtime)
+    console.print(table)
+
+
+@app.command("citybikes-download")
+def citybikes_download(
+    network: Annotated[str, typer.Option(help="CityBikes network slug.")] = "nextbike-brno",
+    data_dir: Annotated[Path, typer.Option(help="Directory for downloaded parquet files.")] = Path(
+        "data/citybikes"
+    ),
+    year: Annotated[list[int] | None, typer.Option(help="Limit to one or more years.")] = None,
+) -> None:
+    """Download CityBikes monthly parquet files for a network."""
+    results = download_network_files(network, data_dir=data_dir, years=year)
+    table = Table(title=f"CityBikes download for {network}")
+    table.add_column("Name")
+    table.add_column("Status")
+    table.add_column("Size", justify="right")
+    table.add_column("Path")
+    for result in results:
+        table.add_row(
+            result.file.name,
+            "downloaded" if result.downloaded else "cached",
+            format_bytes(result.file.size),
+            str(result.path),
+        )
+    console.print(table)
+
+
+@app.command("citybikes-summary")
+def citybikes_summary(
+    network: Annotated[str, typer.Option(help="CityBikes network slug.")] = "nextbike-brno",
+    data_dir: Annotated[Path, typer.Option(help="Directory with downloaded parquet files.")] = Path(
+        "data/citybikes"
+    ),
+) -> None:
+    """Summarize downloaded CityBikes historical parquet files."""
+    summary_row, monthly_rows = summarize_network_history(data_dir, network)
+    summary = Table(title=f"CityBikes history for {network}")
+    summary.add_column("Metric")
+    summary.add_column("Value")
+    summary.add_row("rows", str(summary_row[0]))
+    summary.add_row("first timestamp", str(summary_row[1]))
+    summary.add_row("latest timestamp", str(summary_row[2]))
+    summary.add_row("stations", str(summary_row[3]))
+    summary.add_row("station names", str(summary_row[4]))
+    summary.add_row("first month", str(summary_row[5]))
+    summary.add_row("latest month", str(summary_row[6]))
+    console.print(summary)
+
+    monthly = Table(title="Monthly files")
+    monthly.add_column("Month")
+    monthly.add_column("Rows", justify="right")
+    monthly.add_column("Stations", justify="right")
+    monthly.add_column("Avg bikes/change", justify="right")
+    monthly.add_column("Empty change rows", justify="right")
+    for row in monthly_rows:
+        monthly.add_row(*(str(value) for value in row))
+    console.print(monthly)
+
+
+@app.command("citybikes-area-trend")
+def citybikes_area_trend(
+    lat: Annotated[float | None, typer.Option(help="Latitude of the area origin.")] = None,
+    lon: Annotated[float | None, typer.Option(help="Longitude of the area origin.")] = None,
+    address: Annotated[str | None, typer.Option(help="Address to geocode as the area origin.")] = None,
+    whereami: Annotated[
+        bool,
+        typer.Option(help="Use approximate IP-based geolocation for the area origin."),
+    ] = False,
+    network: Annotated[str, typer.Option(help="CityBikes network slug.")] = "nextbike-brno",
+    data_dir: Annotated[Path, typer.Option(help="Directory with downloaded parquet files.")] = Path(
+        "data/citybikes"
+    ),
+    radius_m: Annotated[int, typer.Option(help="Walkable area radius in meters.")] = 600,
+    sample_minutes: Annotated[int, typer.Option(help="State reconstruction sample interval.")] = 15,
+    report_path: Annotated[Path | None, typer.Option(help="Optional Markdown report output path.")] = None,
+) -> None:
+    """Analyze historical CityBikes availability around an address."""
+    settings = make_settings(None, None, None)
+    lat, lon, location_label = resolve_origin(settings, lat, lon, address, whereami)
+    if radius_m <= 0:
+        raise typer.BadParameter("radius_m must be positive")
+    if sample_minutes <= 0:
+        raise typer.BadParameter("sample_minutes must be positive")
+
+    stations, summary_row, hourly_rows, monthly_rows, station_rows = area_history(
+        data_dir=data_dir,
+        network=network,
+        lat=lat,
+        lon=lon,
+        radius_m=radius_m,
+        sample_minutes=sample_minutes,
+    )
+
+    summary = Table(title=f"Historical CityBikes area trend for {network}")
+    summary.add_column("Metric")
+    summary.add_column("Value")
+    summary.add_row("location source", location_label)
+    summary.add_row("radius", f"{radius_m} m")
+    summary.add_row("sample interval", format_minutes(sample_minutes))
+    summary.add_row("samples", str(summary_row[0]))
+    summary.add_row("first sample", str(summary_row[1]))
+    summary.add_row("latest sample", str(summary_row[2]))
+    summary.add_row("avg bikes in area", str(summary_row[3]))
+    summary.add_row("avg stations with bikes", str(summary_row[4]))
+    summary.add_row("all-empty rate", format_percent(summary_row[5]))
+    console.print(summary)
+
+    station_table = Table(title="Stations in radius")
+    station_table.add_column("Station ID")
+    station_table.add_column("Name")
+    station_table.add_column("Distance", justify="right")
+    for station_id, name, distance_m in stations:
+        station_table.add_row(str(station_id), str(name), format_distance(distance_m))
+    console.print(station_table)
+
+    hourly = Table(title="Hourly area availability, local time")
+    hourly.add_column("Hour")
+    hourly.add_column("Samples", justify="right")
+    hourly.add_column("Avg bikes", justify="right")
+    hourly.add_column("Avg stations with bikes", justify="right")
+    hourly.add_column("All empty", justify="right")
+    for local_hour, samples, avg_bikes, avg_stations, all_empty_rate in hourly_rows:
+        hourly.add_row(
+            str(local_hour),
+            str(samples),
+            str(avg_bikes),
+            str(avg_stations),
+            format_percent(all_empty_rate),
+        )
+    console.print(hourly)
+
+    monthly = Table(title="Morning availability by month, 06:00-10:00")
+    monthly.add_column("Month")
+    monthly.add_column("Samples", justify="right")
+    monthly.add_column("Avg bikes", justify="right")
+    monthly.add_column("Avg stations with bikes", justify="right")
+    monthly.add_column("All empty", justify="right")
+    for local_month, samples, avg_bikes, avg_stations, all_empty_rate in monthly_rows:
+        monthly.add_row(
+            str(local_month),
+            str(samples),
+            str(avg_bikes),
+            str(avg_stations),
+            format_percent(all_empty_rate),
+        )
+    console.print(monthly)
+
+    station_rates = Table(title="Station-level availability")
+    station_rates.add_column("Name")
+    station_rates.add_column("Distance", justify="right")
+    station_rates.add_column("Avg bikes", justify="right")
+    station_rates.add_column("Empty", justify="right")
+    station_rates.add_column("<=1 bike", justify="right")
+    for name, distance_m, _samples, avg_bikes, empty_rate, low_rate in station_rows:
+        station_rates.add_row(
+            str(name),
+            format_distance(distance_m),
+            str(avg_bikes),
+            format_percent(empty_rate),
+            format_percent(low_rate),
+        )
+    console.print(station_rates)
+
+    if report_path is not None:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report = [
+            "# Historical CityBikes Area Trend",
+            "",
+            f"- Network: `{network}`",
+            f"- Location: `{lat:.6f}, {lon:.6f}`",
+            f"- Source: {location_label}",
+            f"- Radius: `{radius_m} m`",
+            f"- Sample interval: `{sample_minutes} minutes`",
+            f"- Window: `{summary_row[1]}` to `{summary_row[2]}`",
+            f"- Samples: `{summary_row[0]}`",
+            f"- Avg bikes in area: `{summary_row[3]}`",
+            f"- All-empty rate: `{format_percent(summary_row[5])}`",
+            "",
+            "## Stations in Radius",
+            "",
+            markdown_table(["Station ID", "Name", "Distance"], stations),
+            "",
+            "## Hourly Area Availability",
+            "",
+            markdown_table(
+                ["Hour", "Samples", "Avg bikes", "Avg stations with bikes", "All empty"],
+                [
+                    [hour, samples, avg_bikes, avg_stations, format_percent(all_empty)]
+                    for hour, samples, avg_bikes, avg_stations, all_empty in hourly_rows
+                ],
+            ),
+            "",
+            "## Morning Availability by Month",
+            "",
+            markdown_table(
+                ["Month", "Samples", "Avg bikes", "Avg stations with bikes", "All empty"],
+                [
+                    [month, samples, avg_bikes, avg_stations, format_percent(all_empty)]
+                    for month, samples, avg_bikes, avg_stations, all_empty in monthly_rows
+                ],
+            ),
+            "",
+            "## Station-Level Availability",
+            "",
+            markdown_table(
+                ["Name", "Distance", "Samples", "Avg bikes", "Empty", "<=1 bike"],
+                [
+                    [
+                        name,
+                        distance_m,
+                        samples,
+                        avg_bikes,
+                        format_percent(empty_rate),
+                        format_percent(low_rate),
+                    ]
+                    for name, distance_m, samples, avg_bikes, empty_rate, low_rate in station_rows
+                ],
+            ),
+            "",
+        ]
+        report_path.write_text("\n".join(report), encoding="utf-8")
+        console.print(f"[green]wrote report[/green] {report_path}")
 
 
 @app.command()
