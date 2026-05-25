@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Iterable, Sequence
+from zoneinfo import ZoneInfo
 
 import duckdb
 import typer
@@ -23,7 +24,9 @@ from nextbike_analysis.boundary import load_brno_boundary
 from nextbike_analysis.citybikes import (
     area_history,
     download_network_files,
+    ensure_network_files,
     list_network_files,
+    network_parquet_glob,
     summarize_network_history,
 )
 from nextbike_analysis.config import Settings
@@ -118,6 +121,22 @@ def station_recommendation(bikes: int, empty_probability: float) -> str:
     return "safe"
 
 
+def strategy_recommendation(bikes: int, empty_rate: float | None) -> str:
+    if bikes <= 0:
+        return "empty now"
+    if bikes == 1:
+        return "last bike"
+    if empty_rate is None:
+        return "live ok"
+    if empty_rate <= 0.15:
+        return "best"
+    if empty_rate <= 0.35:
+        return "good"
+    if empty_rate <= 0.55:
+        return "watch"
+    return "risky"
+
+
 def resolve_origin(
     settings: Settings,
     lat: float | None,
@@ -207,6 +226,23 @@ def short_bike_id(bike_id: object) -> str:
     if len(value) <= 18:
         return value
     return f"{value[:10]}...{value[-6:]}"
+
+
+def quote_sql_path(path: str) -> str:
+    return path.replace("'", "''")
+
+
+def local_hour_now(hour: str | None) -> str:
+    if hour is not None:
+        if len(hour) == 2 and hour.isdigit():
+            hour = f"{hour}:00"
+        if len(hour) != 5 or hour[2:] != ":00" or not hour[:2].isdigit():
+            raise typer.BadParameter("hour must look like HH:00 or HH")
+        value = int(hour[:2])
+        if not 0 <= value <= 23:
+            raise typer.BadParameter("hour must be between 00 and 23")
+        return f"{value:02d}:00"
+    return datetime.now(ZoneInfo("Europe/Prague")).strftime("%H:00")
 
 
 def area_station_cte() -> str:
@@ -1508,6 +1544,312 @@ def nearest(
     if predict_risk:
         console.print(f"[dim]Risk model: {model_path}[/dim]")
     console.print(table)
+
+
+@app.command()
+def strategy(
+    lat: Annotated[float | None, typer.Option(help="Latitude of the strategy origin.")] = None,
+    lon: Annotated[float | None, typer.Option(help="Longitude of the strategy origin.")] = None,
+    address: Annotated[str | None, typer.Option(help="Address to geocode as the strategy origin.")] = None,
+    whereami: Annotated[
+        bool,
+        typer.Option(help="Use approximate IP-based geolocation for the strategy origin."),
+    ] = False,
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+    data_dir: Annotated[
+        Path,
+        typer.Option(help="Directory with CityBikes parquet history."),
+    ] = Path("data/citybikes"),
+    network: Annotated[str, typer.Option(help="CityBikes network name.")] = "nextbike-brno",
+    limit: Annotated[int, typer.Option(help="Maximum station rows to show.")] = 12,
+    max_walk_m: Annotated[int, typer.Option(help="Maximum fallback walk distance in meters.")] = 1600,
+    local_radius_m: Annotated[int, typer.Option(help="Distance considered the local home area.")] = 600,
+    sample_minutes: Annotated[int, typer.Option(help="Historical state sampling interval in minutes.")] = 60,
+    hour: Annotated[
+        str | None,
+        typer.Option(help="Override local hour for historical scoring, e.g. 08:00."),
+    ] = None,
+    refresh: Annotated[
+        bool,
+        typer.Option(help="Collect a fresh station-level snapshot before ranking."),
+    ] = False,
+) -> None:
+    """Rank live bike options using distance and CityBikes historical reliability."""
+    settings = make_settings(None, None, db_path)
+    lat, lon, location_label = resolve_origin(settings, lat, lon, address, whereami)
+    if limit <= 0:
+        raise typer.BadParameter("limit must be positive")
+    if max_walk_m <= 0:
+        raise typer.BadParameter("max_walk_m must be positive")
+    if local_radius_m <= 0:
+        raise typer.BadParameter("local_radius_m must be positive")
+    if local_radius_m > max_walk_m:
+        raise typer.BadParameter("local_radius_m cannot be greater than max_walk_m")
+    if sample_minutes <= 0:
+        raise typer.BadParameter("sample_minutes must be positive")
+
+    scored_hour = local_hour_now(hour)
+
+    if refresh:
+        metrics = collect_once(settings, language="en", include_free_bikes=False)
+        console.print(
+            "[green]refreshed[/green] "
+            f"stations={metrics['station_count']} "
+            f"bikes_available={metrics['bikes_available']}"
+        )
+
+    with connect_db(settings.db_path) as con:
+        latest_row = con.execute(
+            """
+            select collected_at, station_count, bikes_available
+            from collection_runs
+            order by collected_at desc
+            limit 1
+            """
+        ).fetchone()
+        if latest_row is None:
+            raise typer.BadParameter("No local snapshots found. Run `nextbike collect` or use --refresh.")
+
+        live_rows = con.execute(
+            f"""
+            with latest_run as (
+                select collected_at
+                from collection_runs
+                order by collected_at desc
+                limit 1
+            ),
+            station_info as ({LATEST_STATION_INFO_SQL}),
+            candidates as (
+                select
+                    s.station_id,
+                    coalesce(i.name, s.station_id) as name,
+                    coalesce(s.num_bikes_available, 0) as bikes,
+                    i.lat,
+                    i.lon,
+                    2 * 6371000 * asin(sqrt(
+                        pow(sin(radians(i.lat - ?) / 2), 2)
+                        + cos(radians(?)) * cos(radians(i.lat))
+                        * pow(sin(radians(i.lon - ?) / 2), 2)
+                    )) as distance_m
+                from station_status_snapshots s
+                join latest_run lr using (collected_at)
+                left join station_info i using (station_id)
+                where i.lat is not null and i.lon is not null
+            )
+            select
+                station_id,
+                name,
+                bikes,
+                round(distance_m, 0)::integer as distance_m
+            from candidates
+            where distance_m <= ?
+            order by distance_m, name
+            """,
+            [lat, lat, lon, max_walk_m],
+        ).fetchall()
+
+    history_by_station: dict[str, dict[str, float | int | str | None]] = {}
+    history_warning: str | None = None
+    try:
+        ensure_network_files(data_dir, network)
+        parquet_glob = quote_sql_path(network_parquet_glob(data_dir, network))
+        with duckdb.connect() as con:
+            history_rows = con.execute(
+                f"""
+                with r as (
+                    select * from read_parquet('{parquet_glob}', filename = true)
+                ),
+                station_latest as (
+                    select
+                        nuid,
+                        arg_max(name, timestamp) as station_name,
+                        arg_max(latitude, timestamp) as latitude,
+                        arg_max(longitude, timestamp) as longitude
+                    from r
+                    group by nuid
+                ),
+                station_dist as (
+                    select
+                        *,
+                        cast(round(
+                            6371000 * 2 * asin(sqrt(
+                                power(sin(radians((latitude - ?) / 2)), 2)
+                                + cos(radians(?)) * cos(radians(latitude))
+                                * power(sin(radians((longitude - ?) / 2)), 2)
+                            ))
+                        ) as integer) as distance_m
+                    from station_latest
+                    where latitude is not null and longitude is not null
+                ),
+                selected_stations as (
+                    select * from station_dist where distance_m <= ?
+                ),
+                bounds as (
+                    select min(timestamp) as min_ts, max(timestamp) as max_ts from r
+                ),
+                grid as (
+                    select sample_ts
+                    from bounds, generate_series(min_ts, max_ts, interval '{sample_minutes} minutes') as t(sample_ts)
+                ),
+                sampled as (
+                    select
+                        g.sample_ts,
+                        strftime(timezone('Europe/Prague', g.sample_ts at time zone 'UTC'), '%H:00') as local_hour,
+                        s.nuid,
+                        s.station_name,
+                        state.bikes
+                    from grid g
+                    cross join selected_stations s
+                    left join lateral (
+                        select bikes
+                        from r
+                        where r.nuid = s.nuid and r.timestamp <= g.sample_ts
+                        order by r.timestamp desc
+                        limit 1
+                    ) state on true
+                ),
+                overall as (
+                    select
+                        nuid,
+                        any_value(station_name) as station_name,
+                        round(avg(coalesce(bikes, 0)), 2) as hist_avg_bikes,
+                        round(avg(case when coalesce(bikes, 0) = 0 then 1.0 else 0.0 end), 3)
+                            as hist_empty_rate,
+                        round(avg(case when coalesce(bikes, 0) <= 1 then 1.0 else 0.0 end), 3)
+                            as hist_low_rate
+                    from sampled
+                    group by nuid
+                ),
+                hourly as (
+                    select
+                        nuid,
+                        round(avg(case when coalesce(bikes, 0) = 0 then 1.0 else 0.0 end), 3)
+                            as hour_empty_rate
+                    from sampled
+                    where local_hour = ?
+                    group by nuid
+                )
+                select
+                    cast(o.nuid as varchar) as station_id,
+                    o.station_name,
+                    o.hist_avg_bikes,
+                    o.hist_empty_rate,
+                    o.hist_low_rate,
+                    h.hour_empty_rate
+                from overall o
+                left join hourly h using (nuid)
+                """,
+                [lat, lat, lon, max_walk_m, scored_hour],
+            ).fetchall()
+        for row in history_rows:
+            station_id, station_name, hist_avg_bikes, hist_empty_rate, hist_low_rate, hour_empty_rate = row
+            history_by_station[str(station_id)] = {
+                "station_name": station_name,
+                "hist_avg_bikes": hist_avg_bikes,
+                "hist_empty_rate": hist_empty_rate,
+                "hist_low_rate": hist_low_rate,
+                "hour_empty_rate": hour_empty_rate,
+            }
+    except FileNotFoundError as exc:
+        history_warning = str(exc)
+
+    scored_rows: list[dict[str, object]] = []
+    for station_id, name, bikes, distance_m in live_rows:
+        history = history_by_station.get(str(station_id), {})
+        hour_empty_rate = history.get("hour_empty_rate")
+        hist_empty_rate = history.get("hist_empty_rate")
+        hist_low_rate = history.get("hist_low_rate")
+        effective_empty_rate = (
+            float(hour_empty_rate)
+            if hour_empty_rate is not None
+            else float(hist_empty_rate)
+            if hist_empty_rate is not None
+            else None
+        )
+        effective_low_rate = float(hist_low_rate) if hist_low_rate is not None else effective_empty_rate
+        live_bikes = int(bikes)
+        distance = int(distance_m)
+        score = (
+            distance
+            + (effective_empty_rate if effective_empty_rate is not None else 0.5) * 900
+            + (effective_low_rate if effective_low_rate is not None else 0.5) * 400
+            - min(live_bikes, 5) * 140
+            + (5000 if live_bikes <= 0 else 0)
+        )
+        scored_rows.append(
+            {
+                "station_id": station_id,
+                "name": name,
+                "bikes": live_bikes,
+                "distance_m": distance,
+                "tier": "local" if distance <= local_radius_m else "fallback",
+                "hist_avg_bikes": history.get("hist_avg_bikes"),
+                "hist_empty_rate": hist_empty_rate,
+                "hour_empty_rate": effective_empty_rate,
+                "score": score,
+                "recommendation": strategy_recommendation(live_bikes, effective_empty_rate),
+            }
+        )
+
+    scored_rows.sort(key=lambda row: (float(row["score"]), int(row["distance_m"])))
+    selected_rows = scored_rows[:limit]
+    best_live = next((row for row in scored_rows if int(row["bikes"]) > 0), None)
+    local_live = [row for row in scored_rows if row["tier"] == "local" and int(row["bikes"]) > 0]
+    fallback_live = [row for row in scored_rows if row["tier"] == "fallback" and int(row["bikes"]) > 0]
+    best_local_live = local_live[0] if local_live else None
+
+    console.print(f"[dim]Location source: {location_label}[/dim]")
+    console.print(
+        "[dim]"
+        f"Snapshot: {latest_row[0]} | stations={latest_row[1]} | bikes={latest_row[2]} | "
+        f"historical hour={scored_hour}"
+        "[/dim]"
+    )
+    if history_warning is not None:
+        console.print(f"[yellow]{history_warning} Ranking uses live distance and bike counts only.[/yellow]")
+    if best_live is None:
+        console.print(f"[red]No live bikes found within {format_distance(max_walk_m)}.[/red]")
+    elif local_live:
+        console.print(
+            "[green]Best option:[/green] "
+            f"{best_live['name']} ({best_live['bikes']} bikes, {format_distance(best_live['distance_m'])})"
+        )
+        if best_local_live is not None and best_local_live["station_id"] != best_live["station_id"]:
+            console.print(
+                "[dim]Best local option: "
+                f"{best_local_live['name']} ({best_local_live['bikes']} bikes, "
+                f"{format_distance(best_local_live['distance_m'])})[/dim]"
+            )
+    elif fallback_live:
+        console.print(
+            "[yellow]Local area has no live bikes; use fallback:[/yellow] "
+            f"{best_live['name']} ({best_live['bikes']} bikes, {format_distance(best_live['distance_m'])})"
+        )
+
+    table = Table(title=f"Bike strategy within {format_distance(max_walk_m)}")
+    table.add_column("Rec", no_wrap=True)
+    table.add_column("Station", ratio=3)
+    table.add_column("Tier", no_wrap=True)
+    table.add_column("Bikes", justify="right", no_wrap=True)
+    table.add_column("Walk", justify="right", no_wrap=True)
+    table.add_column(f"Empty {scored_hour}", justify="right", no_wrap=True)
+    table.add_column("Hist avg", justify="right", no_wrap=True)
+    table.add_column("Score", justify="right", no_wrap=True)
+    for row in selected_rows:
+        table.add_row(
+            str(row["recommendation"]),
+            str(row["name"]),
+            str(row["tier"]),
+            str(row["bikes"]),
+            format_distance(row["distance_m"]),
+            format_percent(row["hour_empty_rate"]) if row["hour_empty_rate"] is not None else "n/a",
+            f"{float(row['hist_avg_bikes']):.2f}" if row["hist_avg_bikes"] is not None else "n/a",
+            f"{float(row['score']):.0f}",
+        )
+    console.print(table)
+    console.print(
+        "[dim]Score favors live bikes, short walk, low historical empty rate, and low one-bike-or-less rate.[/dim]"
+    )
 
 
 @app.command("area-trend")
