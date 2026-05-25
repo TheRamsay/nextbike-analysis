@@ -49,6 +49,9 @@ uv run nextbike db-stats
 uv run nextbike data-health
 uv run nextbike latest
 uv run nextbike build-dataset --horizon-minutes 30
+uv run nextbike evaluate-baseline
+uv run nextbike train-model
+uv run python scripts/generate_analysis_artifacts.py
 uv run nextbike system-trend --limit 20
 uv run nextbike top-stations --limit 10
 uv run nextbike top-stations --by avg --limit 10

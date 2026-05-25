@@ -125,6 +125,25 @@ def build_station_availability_dataset(
                 lag_5.minutes_since_lag_5m,
                 lag_15.bikes_lag_15m,
                 lag_15.minutes_since_lag_15m,
+                case
+                    when lag_5.bikes_lag_5m is null then null
+                    else b.bikes_now - lag_5.bikes_lag_5m
+                end as bikes_delta_5m,
+                case
+                    when lag_15.bikes_lag_15m is null then null
+                    else b.bikes_now - lag_15.bikes_lag_15m
+                end as bikes_delta_15m,
+                case
+                    when b.capacity is null or b.capacity <= 0 then null
+                    else round(b.bikes_now::double / b.capacity, 4)
+                end as bikes_capacity_ratio,
+                sin(2 * pi() * b.hour / 24.0) as hour_sin,
+                cos(2 * pi() * b.hour / 24.0) as hour_cos,
+                sin(2 * pi() * b.weekday / 7.0) as weekday_sin,
+                cos(2 * pi() * b.weekday / 7.0) as weekday_cos,
+                rolling_30.bikes_avg_30m,
+                rolling_30.empty_rate_30m,
+                rolling_30.samples_30m,
                 future.collected_at as target_collected_at,
                 date_diff('minute', b.collected_at, future.collected_at) as minutes_to_target,
                 future.bikes_future,
@@ -164,6 +183,19 @@ def build_station_availability_dataset(
                 order by l.collected_at desc
                 limit 1
             ) lag_15 on true
+            left join lateral (
+                select
+                    round(avg(coalesce(r.num_bikes_available, 0)), 4) as bikes_avg_30m,
+                    round(
+                        avg(case when coalesce(r.num_bikes_available, 0) = 0 then 1.0 else 0.0 end),
+                        4
+                    ) as empty_rate_30m,
+                    count(*) as samples_30m
+                from station_status_snapshots r
+                where r.station_id = b.station_id
+                    and r.collected_at < b.collected_at
+                    and r.collected_at >= b.collected_at - (30 * interval '1 minute')
+            ) rolling_30 on true
             """,
             [
                 horizon_minutes,

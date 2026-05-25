@@ -27,12 +27,49 @@ from nextbike_analysis.db import LATEST_STATION_INFO_SQL, connect_db
 from nextbike_analysis.formatting import bike_risk, tail_lines
 from nextbike_analysis.geo import get_address_location, get_ip_location
 from nextbike_analysis.gbfs import DEFAULT_FEEDS, GbfsClient
+from nextbike_analysis.modeling import EvaluationResult, evaluate_baselines, train_models
 from nextbike_analysis.poller import pid_is_running, poller_paths, read_pid
 from nextbike_analysis.reports import get_data_health, get_system_trend
 from nextbike_analysis.storage import SnapshotStore, utc_now
 
 app = typer.Typer(no_args_is_help=True)
 console = Console()
+
+
+def render_evaluation_result(result: EvaluationResult, title: str) -> None:
+    summary = Table(title=title)
+    summary.add_column("Metric")
+    summary.add_column("Value")
+    summary.add_row("table", result.table_name)
+    summary.add_row("target", result.target)
+    summary.add_row("split collected_at", str(result.split_collected_at))
+    summary.add_row("train rows", str(result.train_rows))
+    summary.add_row("test rows", str(result.test_rows))
+    summary.add_row("train window", result.train_window)
+    summary.add_row("test window", result.test_window)
+    console.print(summary)
+
+    metrics = Table(title="Metrics")
+    metrics.add_column("Model")
+    metrics.add_column("Accuracy", justify="right")
+    metrics.add_column("Precision", justify="right")
+    metrics.add_column("Recall", justify="right")
+    metrics.add_column("F1", justify="right")
+    metrics.add_column("ROC AUC", justify="right")
+    metrics.add_column("Avg precision", justify="right")
+    metrics.add_column("Pred empty rate", justify="right")
+    for row in sorted(result.metrics, key=lambda item: item.f1, reverse=True):
+        metrics.add_row(
+            row.name,
+            f"{row.accuracy:.4f}",
+            f"{row.precision:.4f}",
+            f"{row.recall:.4f}",
+            f"{row.f1:.4f}",
+            f"{row.roc_auc:.4f}" if row.roc_auc is not None else "n/a",
+            f"{row.average_precision:.4f}" if row.average_precision is not None else "n/a",
+            f"{row.positive_rate:.4f}",
+        )
+    console.print(metrics)
 
 
 @contextmanager
@@ -521,6 +558,83 @@ def build_dataset(
     table.add_row("future empty rate", str(result.empty_future_rate))
     table.add_row("avg minutes to target", str(result.avg_minutes_to_target))
     console.print(table)
+
+
+@app.command("evaluate-baseline")
+def evaluate_baseline(
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+    table_name: Annotated[
+        str,
+        typer.Option(help="Training dataset table name."),
+    ] = "training_station_availability",
+    test_fraction: Annotated[
+        float,
+        typer.Option(help="Newest fraction of timestamps used as test set."),
+    ] = 0.25,
+    low_bike_threshold: Annotated[
+        int,
+        typer.Option(help="Threshold for low-inventory baseline."),
+    ] = 1,
+) -> None:
+    """Evaluate simple baselines for predicting whether a station will be empty."""
+    if not 0 < test_fraction < 1:
+        raise typer.BadParameter("test_fraction must be between 0 and 1")
+    if low_bike_threshold < 0:
+        raise typer.BadParameter("low_bike_threshold cannot be negative")
+
+    settings = make_settings(None, None, db_path)
+    try:
+        result = evaluate_baselines(
+            db_path=settings.db_path,
+            table_name=table_name,
+            test_fraction=test_fraction,
+            low_bike_threshold=low_bike_threshold,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    render_evaluation_result(result, "Baseline evaluation")
+
+
+@app.command("train-model")
+def train_model(
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+    data_dir: Annotated[Path | None, typer.Option(help="Directory for model artifacts.")] = None,
+    table_name: Annotated[
+        str,
+        typer.Option(help="Training dataset table name."),
+    ] = "training_station_availability",
+    test_fraction: Annotated[
+        float,
+        typer.Option(help="Newest fraction of timestamps used as test set."),
+    ] = 0.25,
+    save_models: Annotated[
+        bool,
+        typer.Option(help="Persist trained sklearn models under data/models/."),
+    ] = True,
+) -> None:
+    """Train first sklearn tabular models for future station emptiness."""
+    if not 0 < test_fraction < 1:
+        raise typer.BadParameter("test_fraction must be between 0 and 1")
+
+    settings = make_settings(None, data_dir, db_path)
+    model_dir = settings.data_dir / "models" if save_models else None
+    try:
+        result, saved_models = train_models(
+            db_path=settings.db_path,
+            table_name=table_name,
+            test_fraction=test_fraction,
+            model_dir=model_dir,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    render_evaluation_result(result, "Model evaluation")
+    if saved_models:
+        table = Table(title="Saved models")
+        table.add_column("Model")
+        table.add_column("Path")
+        for name, path in saved_models.items():
+            table.add_row(name, str(path))
+        console.print(table)
 
 
 @app.command("data-health")
