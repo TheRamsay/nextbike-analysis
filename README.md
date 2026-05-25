@@ -67,6 +67,8 @@ uv run nextbike nearest --address "Moravské náměstí, Brno" --refresh
 uv run nextbike nearest --address "Moravské náměstí, Brno" --predict-risk
 uv run nextbike nearest --address "Moravské náměstí, Brno" --reliable --predict-risk
 uv run nextbike nearest --whereami
+uv run nextbike area-trend --address "YOUR_ADDRESS, Brno" --radius-m 600
+uv run nextbike area-trend --address "YOUR_ADDRESS, Brno" --radius-m 600 --report-path reports/local_area_trend.md
 uv run nextbike dashboard
 uv run nextbike dashboard --once --width 100 --height 30
 uv run nextbike dashboard --background footprint

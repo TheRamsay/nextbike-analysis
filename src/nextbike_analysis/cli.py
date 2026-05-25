@@ -11,7 +11,7 @@ import tty
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Iterable, Sequence
 
 import duckdb
 import typer
@@ -110,6 +110,50 @@ def station_recommendation(bikes: int, empty_probability: float) -> str:
     if empty_probability >= 0.4:
         return "watch"
     return "safe"
+
+
+def resolve_origin(
+    settings: Settings,
+    lat: float | None,
+    lon: float | None,
+    address: str | None,
+    whereami: bool,
+) -> tuple[float, float, str]:
+    origin_modes = sum(
+        [
+            lat is not None or lon is not None,
+            address is not None,
+            whereami,
+        ]
+    )
+    if origin_modes != 1:
+        raise typer.BadParameter("Use exactly one origin: both --lat/--lon, --address, or --whereami")
+
+    location_label = "manual"
+    if whereami:
+        lat, lon, location_label = get_ip_location(settings.request_timeout_seconds)
+    elif address is not None:
+        lat, lon, location_label = get_address_location(address, settings.request_timeout_seconds)
+
+    if lat is None or lon is None:
+        raise typer.BadParameter("Provide both --lat and --lon")
+    if not -90 <= lat <= 90:
+        raise typer.BadParameter("lat must be between -90 and 90")
+    if not -180 <= lon <= 180:
+        raise typer.BadParameter("lon must be between -180 and 180")
+
+    return lat, lon, location_label
+
+
+def markdown_table(headers: Sequence[str], rows: Iterable[Sequence[object]]) -> str:
+    row_list = [[str(value) for value in row] for row in rows]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in row_list:
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
 
 
 def make_settings(
@@ -1148,29 +1192,8 @@ def nearest(
     ] = None,
 ) -> None:
     """Show the nearest stations from the latest snapshot."""
-    location_label = "manual"
     settings = make_settings(None, None, db_path)
-    origin_modes = sum(
-        [
-            lat is not None or lon is not None,
-            address is not None,
-            whereami,
-        ]
-    )
-    if origin_modes != 1:
-        raise typer.BadParameter("Use exactly one origin: both --lat/--lon, --address, or --whereami")
-
-    if whereami:
-        lat, lon, location_label = get_ip_location(settings.request_timeout_seconds)
-    elif address is not None:
-        lat, lon, location_label = get_address_location(address, settings.request_timeout_seconds)
-
-    if lat is None or lon is None:
-        raise typer.BadParameter("Provide both --lat and --lon")
-    if not -90 <= lat <= 90:
-        raise typer.BadParameter("lat must be between -90 and 90")
-    if not -180 <= lon <= 180:
-        raise typer.BadParameter("lon must be between -180 and 180")
+    lat, lon, location_label = resolve_origin(settings, lat, lon, address, whereami)
     if limit <= 0:
         raise typer.BadParameter("limit must be positive")
     if max_distance_m is not None and max_distance_m <= 0:
@@ -1344,6 +1367,366 @@ def nearest(
     if predict_risk:
         console.print(f"[dim]Risk model: {model_path}[/dim]")
     console.print(table)
+
+
+@app.command("area-trend")
+def area_trend(
+    lat: Annotated[float | None, typer.Option(help="Latitude of the area origin.")] = None,
+    lon: Annotated[float | None, typer.Option(help="Longitude of the area origin.")] = None,
+    address: Annotated[str | None, typer.Option(help="Address to geocode as the area origin.")] = None,
+    whereami: Annotated[
+        bool,
+        typer.Option(help="Use approximate IP-based geolocation for the area origin."),
+    ] = False,
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+    radius_m: Annotated[int, typer.Option(help="Walkable area radius in meters.")] = 600,
+    limit: Annotated[int, typer.Option(help="Maximum nearby station rows to show.")] = 12,
+    timezone: Annotated[str, typer.Option(help="Timezone for hourly grouping.")] = "Europe/Prague",
+    report_path: Annotated[Path | None, typer.Option(help="Optional Markdown report output path.")] = None,
+) -> None:
+    """Analyze when bikes disappear around an address or point."""
+    settings = make_settings(None, None, db_path)
+    lat, lon, location_label = resolve_origin(settings, lat, lon, address, whereami)
+    if radius_m <= 0:
+        raise typer.BadParameter("radius_m must be positive")
+    if limit <= 0:
+        raise typer.BadParameter("limit must be positive")
+
+    distance_sql = """
+        cast(round(
+            6371000 * 2 * asin(sqrt(
+                power(sin(radians((i.lat - ?) / 2)), 2)
+                + cos(radians(?)) * cos(radians(i.lat))
+                * power(sin(radians((i.lon - ?) / 2)), 2)
+            ))
+        ) as integer)
+    """
+    station_cte = f"""
+        with station_info as ({LATEST_STATION_INFO_SQL}),
+        stations as (
+            select
+                i.station_id,
+                coalesce(i.name, i.station_id) as name,
+                i.region_id,
+                i.lat,
+                i.lon,
+                {distance_sql} as distance_m
+            from station_info i
+        )
+    """
+
+    with connect_db(settings.db_path) as con:
+        coverage_row = con.execute(
+            f"""
+            {station_cte},
+            area_rows as (
+                select s.collected_at, s.station_id, s.num_bikes_available
+                from station_status_snapshots s
+                join stations st using (station_id)
+                where st.distance_m <= ?
+            )
+            select
+                min(collected_at) as first_collected,
+                max(collected_at) as latest_collected,
+                count(distinct collected_at) as snapshots,
+                count(*) as station_rows,
+                count(distinct station_id) as stations
+            from area_rows
+            """,
+            [lat, lat, lon, radius_m],
+        ).fetchone()
+
+        latest_area_row = con.execute(
+            f"""
+            {station_cte},
+            latest_snapshot as (
+                select max(collected_at) as collected_at
+                from station_status_snapshots
+            )
+            select
+                sum(s.num_bikes_available) as total_bikes,
+                count_if(s.num_bikes_available > 0) as stations_with_bikes,
+                count_if(s.num_bikes_available = 0) as empty_stations
+            from station_status_snapshots s
+            join latest_snapshot l using (collected_at)
+            join stations st using (station_id)
+            where st.distance_m <= ?
+            """,
+            [lat, lat, lon, radius_m],
+        ).fetchone()
+
+        station_rows = con.execute(
+            f"""
+            {station_cte},
+            latest_snapshot as (
+                select max(collected_at) as collected_at
+                from station_status_snapshots
+            ),
+            station_history as (
+                select
+                    s.station_id,
+                    count(*) as samples,
+                    round(avg(s.num_bikes_available), 2) as avg_bikes,
+                    round(avg(case when s.num_bikes_available = 0 then 1.0 else 0.0 end), 3)
+                        as empty_rate,
+                    round(avg(case when s.num_bikes_available <= 1 then 1.0 else 0.0 end), 3)
+                        as low_rate
+                from station_status_snapshots s
+                join stations st using (station_id)
+                where st.distance_m <= ?
+                group by s.station_id
+            )
+            select
+                st.station_id,
+                st.name,
+                coalesce(ls.num_bikes_available, 0) as latest_bikes,
+                st.distance_m,
+                coalesce(h.avg_bikes, 0) as avg_bikes,
+                coalesce(h.empty_rate, 0) as empty_rate,
+                coalesce(h.low_rate, 0) as low_rate,
+                coalesce(h.samples, 0) as samples
+            from stations st
+            left join latest_snapshot l on true
+            left join station_status_snapshots ls
+                on ls.station_id = st.station_id
+                and ls.collected_at = l.collected_at
+            left join station_history h
+                on h.station_id = st.station_id
+            where st.distance_m <= ?
+            order by st.distance_m, st.name
+            limit ?
+            """,
+            [lat, lat, lon, radius_m, radius_m, limit],
+        ).fetchall()
+
+        hourly_rows = con.execute(
+            f"""
+            {station_cte},
+            area_state as (
+                select
+                    s.collected_at,
+                    strftime(timezone(?, s.collected_at), '%H:00') as local_hour,
+                    sum(s.num_bikes_available) as total_bikes,
+                    count_if(s.num_bikes_available > 0) as stations_with_bikes,
+                    count_if(s.num_bikes_available = 0) as empty_stations
+                from station_status_snapshots s
+                join stations st using (station_id)
+                where st.distance_m <= ?
+                group by s.collected_at, local_hour
+            )
+            select
+                local_hour,
+                count(*) as samples,
+                round(avg(total_bikes), 2) as avg_total_bikes,
+                round(avg(stations_with_bikes), 2) as avg_stations_with_bikes,
+                round(avg(empty_stations), 2) as avg_empty_stations,
+                round(avg(case when stations_with_bikes = 0 then 1.0 else 0.0 end), 3)
+                    as all_empty_rate
+            from area_state
+            group by local_hour
+            order by local_hour
+            """,
+            [lat, lat, lon, timezone, radius_m],
+        ).fetchall()
+
+        depletion_rows = con.execute(
+            f"""
+            {station_cte},
+            transitions as (
+                select
+                    s.station_id,
+                    s.collected_at,
+                    s.num_bikes_available,
+                    lag(s.num_bikes_available) over (
+                        partition by s.station_id
+                        order by s.collected_at
+                    ) as previous_bikes
+                from station_status_snapshots s
+                join stations st using (station_id)
+                where st.distance_m <= ?
+            )
+            select
+                strftime(timezone(?, collected_at), '%H:00') as local_hour,
+                count(*) as depletion_events
+            from transitions
+            where previous_bikes > 0 and num_bikes_available = 0
+            group by local_hour
+            order by depletion_events desc, local_hour
+            """,
+            [lat, lat, lon, radius_m, timezone],
+        ).fetchall()
+
+    summary = Table(title=f"Area trend around {lat:.6f}, {lon:.6f}")
+    summary.add_column("Metric")
+    summary.add_column("Value")
+    summary.add_row("location source", location_label)
+    summary.add_row("radius", f"{radius_m} m")
+    summary.add_row("first collected", str(coverage_row[0]))
+    summary.add_row("latest collected", str(coverage_row[1]))
+    summary.add_row("area snapshots", str(coverage_row[2] or 0))
+    summary.add_row("station rows", str(coverage_row[3] or 0))
+    summary.add_row("stations in radius", str(coverage_row[4] or 0))
+    summary.add_row("latest bikes in radius", str(latest_area_row[0] or 0))
+    summary.add_row("latest stations with bikes", str(latest_area_row[1] or 0))
+    summary.add_row("latest empty stations", str(latest_area_row[2] or 0))
+    console.print(summary)
+
+    if not station_rows:
+        console.print("[yellow]No stations found inside this radius.[/yellow]")
+        raise typer.Exit(code=1)
+
+    station_table = Table(title="Nearby stations")
+    station_table.add_column("Name", ratio=3)
+    station_table.add_column("Station ID", no_wrap=True)
+    station_table.add_column("Now", justify="right", no_wrap=True)
+    station_table.add_column("Distance m", justify="right", no_wrap=True)
+    station_table.add_column("Avg bikes", justify="right", no_wrap=True)
+    station_table.add_column("Empty", justify="right", no_wrap=True)
+    station_table.add_column("<=1 bike", justify="right", no_wrap=True)
+    for station_id, name, latest_bikes, distance_m, avg_bikes, empty_rate, low_rate, _samples in station_rows:
+        station_table.add_row(
+            str(name),
+            str(station_id),
+            str(latest_bikes),
+            str(distance_m),
+            str(avg_bikes),
+            f"{float(empty_rate) * 100:.1f}%",
+            f"{float(low_rate) * 100:.1f}%",
+        )
+    console.print(station_table)
+
+    hourly_table = Table(title="Hourly area availability")
+    hourly_table.add_column("Hour")
+    hourly_table.add_column("Samples", justify="right")
+    hourly_table.add_column("Avg bikes", justify="right")
+    hourly_table.add_column("Avg stations with bikes", justify="right")
+    hourly_table.add_column("Avg empty stations", justify="right")
+    hourly_table.add_column("All empty", justify="right")
+    for local_hour, samples, avg_total, avg_with_bikes, avg_empty, all_empty_rate in hourly_rows:
+        hourly_table.add_row(
+            str(local_hour),
+            str(samples),
+            str(avg_total),
+            str(avg_with_bikes),
+            str(avg_empty),
+            f"{float(all_empty_rate) * 100:.1f}%",
+        )
+    console.print(hourly_table)
+
+    depletion_table = Table(title="Observed station depletion events")
+    depletion_table.add_column("Hour")
+    depletion_table.add_column("Events", justify="right")
+    for local_hour, events in depletion_rows:
+        depletion_table.add_row(str(local_hour), str(events))
+    console.print(depletion_table)
+
+    morning_rows = [row for row in hourly_rows if "05:00" <= str(row[0]) <= "12:00"]
+    first_low_row = next((row for row in morning_rows if float(row[2]) <= 1.0), None)
+    first_all_empty_row = next((row for row in morning_rows if float(row[5]) > 0.0), None)
+    full_empty_row = next((row for row in morning_rows if float(row[5]) >= 1.0), None)
+    interpretation_rows = [
+        (
+            "first morning hour averaging <= 1 bike",
+            first_low_row[0] if first_low_row is not None else "not observed",
+        ),
+        (
+            "first morning hour with all-empty samples",
+            first_all_empty_row[0] if first_all_empty_row is not None else "not observed",
+        ),
+        (
+            "first morning hour fully empty in current data",
+            full_empty_row[0] if full_empty_row is not None else "not observed",
+        ),
+    ]
+    interpretation_table = Table(title="Preliminary read")
+    interpretation_table.add_column("Signal")
+    interpretation_table.add_column("Hour", justify="right")
+    for signal, hour in interpretation_rows:
+        interpretation_table.add_row(signal, str(hour))
+    console.print(interpretation_table)
+
+    if report_path is not None:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report = [
+            "# Local Nextbike Availability Trend",
+            "",
+            f"- Location: `{lat:.6f}, {lon:.6f}`",
+            f"- Source: {location_label}",
+            f"- Radius: `{radius_m} m`",
+            f"- Data window: `{coverage_row[0]}` to `{coverage_row[1]}`",
+            f"- Snapshots: `{coverage_row[2] or 0}`",
+            f"- Stations in radius: `{coverage_row[4] or 0}`",
+            f"- Latest bikes in radius: `{latest_area_row[0] or 0}`",
+            "",
+            "## Preliminary Read",
+            "",
+            markdown_table(["Signal", "Hour"], interpretation_rows),
+            "",
+            "## Nearby Stations",
+            "",
+            markdown_table(
+                ["Name", "Station ID", "Now", "Distance m", "Avg bikes", "Empty", "<=1 bike"],
+                [
+                    [
+                        name,
+                        station_id,
+                        latest_bikes,
+                        distance_m,
+                        avg_bikes,
+                        f"{float(empty_rate) * 100:.1f}%",
+                        f"{float(low_rate) * 100:.1f}%",
+                    ]
+                    for (
+                        station_id,
+                        name,
+                        latest_bikes,
+                        distance_m,
+                        avg_bikes,
+                        empty_rate,
+                        low_rate,
+                        _samples,
+                    ) in station_rows
+                ],
+            ),
+            "",
+            "## Hourly Area Availability",
+            "",
+            markdown_table(
+                [
+                    "Hour",
+                    "Samples",
+                    "Avg bikes",
+                    "Avg stations with bikes",
+                    "Avg empty stations",
+                    "All empty",
+                ],
+                [
+                    [
+                        local_hour,
+                        samples,
+                        avg_total,
+                        avg_with_bikes,
+                        avg_empty,
+                        f"{float(all_empty_rate) * 100:.1f}%",
+                    ]
+                    for (
+                        local_hour,
+                        samples,
+                        avg_total,
+                        avg_with_bikes,
+                        avg_empty,
+                        all_empty_rate,
+                    ) in hourly_rows
+                ],
+            ),
+            "",
+            "## Observed Station Depletion Events",
+            "",
+            markdown_table(["Hour", "Events"], depletion_rows),
+            "",
+        ]
+        report_path.write_text("\n".join(report), encoding="utf-8")
+        console.print(f"[green]wrote report[/green] {report_path}")
 
 
 @app.command()
