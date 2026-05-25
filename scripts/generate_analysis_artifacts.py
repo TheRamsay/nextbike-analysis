@@ -154,6 +154,21 @@ def build_markdown_report(
 ) -> str:
     best_baseline = max(baseline.metrics, key=lambda row: row.f1)
     best_model = max(model_result.metrics, key=lambda row: row.f1)
+    model_delta = best_model.f1 - best_baseline.f1
+    if model_delta > 0.002:
+        interpretation = (
+            "The best trained model is slightly ahead of persistence on this split, "
+            "but the margin is still small."
+        )
+    elif model_delta < -0.002:
+        interpretation = (
+            "The best trained model does not beat persistence on this split. "
+            "That makes persistence the operational baseline to beat."
+        )
+    else:
+        interpretation = (
+            "The best trained model and persistence are effectively tied on this split."
+        )
     return f"""# Nextbike Brno Availability Modeling Report
 
 Generated at: `{generated_at.isoformat()}`
@@ -162,13 +177,13 @@ Generated at: `{generated_at.isoformat()}`
 
 We now have an end-to-end local pipeline: poll GBFS, normalize to DuckDB, build a station-level ML dataset, evaluate simple baselines, and train first sklearn tabular models.
 
-The current data is still mostly evening/night behavior, so the strongest baseline is simple persistence: assume a station's 30-minute future emptiness equals its current emptiness. That baseline is very hard to beat because stations barely change during this window.
+The current data now includes evening, overnight, and early morning behavior. The strongest baseline is still simple persistence: assume a station's 30-minute future emptiness equals its current emptiness. That baseline is hard to beat because many stations remain stable over a 30-minute horizon.
 
 Best baseline by F1: `{best_baseline.name}` with F1 `{best_baseline.f1:.4f}`.
 
 Best trained model by F1: `{best_model.name}` with F1 `{best_model.f1:.4f}`.
 
-Interpretation: the best model is slightly ahead of persistence on this split, but the margin is small. We need morning commute, daytime, and weekend data before judging model class quality.
+Interpretation: {interpretation} We still need daytime, afternoon, and weekend data before judging model class quality.
 
 ## Data Snapshot
 
@@ -219,10 +234,10 @@ Models trained:
 
 ## Findings
 
-- The problem is currently dominated by inertia. `empty_now` almost fully predicts `empty_future` in the overnight sample.
+- The problem is currently dominated by inertia. `empty_now` is still a very strong predictor of `empty_future`.
 - `station_prior_empty_rate` is strong, which means station identity matters.
 - `low_inventory_le_1` has perfect or near-perfect recall but many false positives; useful if the product goal is "never walk to a station likely to be empty".
-- The trained models are useful as scoring/ranking models because ROC AUC and average precision are high; current F1 is only slightly better than persistence and should not be overinterpreted.
+- The trained models are useful as scoring/ranking models because ROC AUC and average precision are high; current F1 versus persistence should not be overinterpreted until we have broader daytime coverage.
 
 ## Next Work
 
