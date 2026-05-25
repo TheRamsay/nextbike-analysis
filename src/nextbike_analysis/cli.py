@@ -27,7 +27,12 @@ from nextbike_analysis.db import LATEST_STATION_INFO_SQL, connect_db
 from nextbike_analysis.formatting import bike_risk, tail_lines
 from nextbike_analysis.geo import get_address_location, get_ip_location
 from nextbike_analysis.gbfs import DEFAULT_FEEDS, GbfsClient
-from nextbike_analysis.modeling import EvaluationResult, evaluate_baselines, train_models
+from nextbike_analysis.modeling import (
+    EvaluationResult,
+    evaluate_baselines,
+    predict_latest_station_risk,
+    train_models,
+)
 from nextbike_analysis.poller import pid_is_running, poller_paths, read_pid
 from nextbike_analysis.reports import get_data_health, get_system_trend
 from nextbike_analysis.storage import SnapshotStore, utc_now
@@ -94,6 +99,16 @@ def read_keypress() -> str | None:
     if not readable:
         return None
     return sys.stdin.read(1)
+
+
+def station_recommendation(bikes: int, empty_probability: float) -> str:
+    if bikes <= 0:
+        return "skip"
+    if empty_probability >= 0.7:
+        return "risky"
+    if empty_probability >= 0.4:
+        return "watch"
+    return "safe"
 
 
 def make_settings(
@@ -1041,6 +1056,14 @@ def nearest(
         bool,
         typer.Option(help="Collect a fresh station-level snapshot before searching."),
     ] = False,
+    predict_risk: Annotated[
+        bool,
+        typer.Option(help="Score nearest stations with the trained 30-minute emptiness model."),
+    ] = False,
+    model_path: Annotated[
+        Path | None,
+        typer.Option(help="Path to a trained sklearn model. Defaults to data/models/hist_gradient_boosting.joblib."),
+    ] = None,
 ) -> None:
     """Show the nearest stations from the latest snapshot."""
     location_label = "manual"
@@ -1132,28 +1155,69 @@ def nearest(
             params,
         ).fetchall()
 
+    predictions = {}
+    if predict_risk:
+        model_path = model_path or (settings.data_dir / "models" / "hist_gradient_boosting.joblib")
+        try:
+            predictions = predict_latest_station_risk(
+                db_path=settings.db_path,
+                model_path=model_path,
+                station_ids=[str(row[0]) for row in rows],
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+
     table = Table(title=f"Nearest stations from {lat:.6f}, {lon:.6f}")
-    table.add_column("Station ID")
-    table.add_column("Name")
-    table.add_column("Region")
-    table.add_column("Bikes", justify="right")
-    table.add_column("Risk")
-    table.add_column("Distance m", justify="right")
-    table.add_column("Lat", justify="right")
-    table.add_column("Lon", justify="right")
+    if predict_risk:
+        table.add_column("Name", ratio=3)
+        table.add_column("Bikes", justify="right", no_wrap=True)
+        table.add_column("Now", no_wrap=True)
+        table.add_column("Empty 30m", no_wrap=True)
+        table.add_column("Rec", no_wrap=True)
+        table.add_column("Distance m", justify="right", no_wrap=True)
+    else:
+        table.add_column("Name", ratio=3)
+        table.add_column("Station ID", no_wrap=True)
+        table.add_column("Bikes", justify="right", no_wrap=True)
+        table.add_column("Risk", no_wrap=True)
+        table.add_column("Distance m", justify="right", no_wrap=True)
+        table.add_column("Lat", justify="right", no_wrap=True)
+        table.add_column("Lon", justify="right", no_wrap=True)
     for row in rows:
         station_id, name, region_id, bikes, distance_m, station_lat, station_lon = row
+        current_risk = bike_risk(int(bikes))
+        if predict_risk:
+            table_row = [
+                str(name),
+                str(bikes),
+                current_risk,
+            ]
+            prediction = predictions.get(str(station_id))
+            if prediction is None:
+                table_row.extend(["n/a", "?"])
+            else:
+                table_row.extend(
+                    [
+                        f"{prediction.empty_probability * 100:.1f}% {prediction.risk_label}",
+                        station_recommendation(int(bikes), prediction.empty_probability),
+                    ]
+                )
+            table_row.append(str(distance_m))
+        else:
+            table_row = [
+                str(name),
+                str(station_id),
+                str(bikes),
+                current_risk,
+                str(distance_m),
+            ]
+            table_row.extend([str(station_lat), str(station_lon)])
         table.add_row(
-            str(station_id),
-            str(name),
-            str(region_id),
-            str(bikes),
-            bike_risk(int(bikes)),
-            str(distance_m),
-            str(station_lat),
-            str(station_lon),
+            *table_row,
         )
     console.print(f"[dim]Location source: {location_label}[/dim]")
+    if predict_risk:
+        console.print(f"[dim]Risk model: {model_path}[/dim]")
     console.print(table)
 
 

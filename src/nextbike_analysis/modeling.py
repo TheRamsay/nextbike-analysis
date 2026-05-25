@@ -83,6 +83,13 @@ class EvaluationResult:
     metrics: list[MetricRow]
 
 
+@dataclass(frozen=True)
+class StationRiskPrediction:
+    station_id: str
+    empty_probability: float
+    risk_label: str
+
+
 def load_dataset(db_path: Path, table_name: str) -> pd.DataFrame:
     table_name = validate_table_name(table_name)
     with duckdb.connect(str(db_path), read_only=True) as con:
@@ -95,6 +102,185 @@ def load_dataset(db_path: Path, table_name: str) -> pd.DataFrame:
             "Rebuild it with `uv run nextbike build-dataset`."
         )
     return df
+
+
+def load_model(model_path: Path) -> Any:
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"Model does not exist: {model_path}. Run `uv run nextbike train-model` first."
+        )
+    return joblib.load(model_path)
+
+
+def predict_latest_station_risk(
+    *,
+    db_path: Path,
+    model_path: Path,
+    station_ids: list[str],
+) -> dict[str, StationRiskPrediction]:
+    if not station_ids:
+        return {}
+    model = load_model(model_path)
+    features = load_latest_station_features(db_path, station_ids)
+    if features.empty:
+        return {}
+    probabilities = model.predict_proba(features[MODEL_FEATURES])[:, 1]
+    predictions: dict[str, StationRiskPrediction] = {}
+    for station_id, probability in zip(features["station_id"], probabilities, strict=True):
+        probability = float(probability)
+        predictions[str(station_id)] = StationRiskPrediction(
+            station_id=str(station_id),
+            empty_probability=probability,
+            risk_label=risk_label(probability),
+        )
+    return predictions
+
+
+def risk_label(empty_probability: float) -> str:
+    if empty_probability >= 0.7:
+        return "high"
+    if empty_probability >= 0.4:
+        return "medium"
+    return "low"
+
+
+def load_latest_station_features(db_path: Path, station_ids: list[str]) -> pd.DataFrame:
+    placeholders = ", ".join("?" for _ in station_ids)
+    with duckdb.connect(str(db_path), read_only=True) as con:
+        return con.execute(
+            f"""
+            with latest_run as (
+                select collected_at
+                from collection_runs
+                order by collected_at desc
+                limit 1
+            ),
+            station_info as (
+                select
+                    station_id,
+                    name,
+                    short_name,
+                    region_id,
+                    lat,
+                    lon,
+                    capacity
+                from (
+                    select
+                        station_id,
+                        name,
+                        short_name,
+                        region_id,
+                        lat,
+                        lon,
+                        capacity,
+                        row_number() over (
+                            partition by station_id
+                            order by observed_at desc
+                        ) as rn
+                    from station_information
+                )
+                where rn = 1
+            ),
+            base as (
+                select
+                    s.station_id,
+                    s.collected_at,
+                    coalesce(s.num_bikes_available, 0) as bikes_now,
+                    coalesce(s.num_docks_available, 0) as docks_now,
+                    coalesce(s.num_bikes_available, 0) > 0 as has_bike_now,
+                    coalesce(s.num_bikes_available, 0) = 0 as empty_now,
+                    s.is_renting,
+                    s.is_returning,
+                    i.region_id,
+                    i.lat,
+                    i.lon,
+                    i.capacity,
+                    cast(strftime(s.collected_at, '%H') as integer) as hour,
+                    cast(strftime(s.collected_at, '%w') as integer) as weekday,
+                    cast(strftime(s.collected_at, '%w') as integer) in (0, 6) as is_weekend
+                from station_status_snapshots s
+                join latest_run lr using (collected_at)
+                left join station_info i using (station_id)
+                where s.station_id in ({placeholders})
+            )
+            select
+                b.station_id,
+                b.region_id,
+                b.hour,
+                b.weekday,
+                b.is_weekend,
+                b.bikes_now,
+                b.docks_now,
+                b.has_bike_now,
+                b.empty_now,
+                b.is_renting,
+                b.is_returning,
+                lag_5.bikes_lag_5m,
+                lag_5.minutes_since_lag_5m,
+                lag_15.bikes_lag_15m,
+                lag_15.minutes_since_lag_15m,
+                case
+                    when lag_5.bikes_lag_5m is null then null
+                    else b.bikes_now - lag_5.bikes_lag_5m
+                end as bikes_delta_5m,
+                case
+                    when lag_15.bikes_lag_15m is null then null
+                    else b.bikes_now - lag_15.bikes_lag_15m
+                end as bikes_delta_15m,
+                case
+                    when b.capacity is null or b.capacity <= 0 then null
+                    else round(b.bikes_now::double / b.capacity, 4)
+                end as bikes_capacity_ratio,
+                sin(2 * pi() * b.hour / 24.0) as hour_sin,
+                cos(2 * pi() * b.hour / 24.0) as hour_cos,
+                sin(2 * pi() * b.weekday / 7.0) as weekday_sin,
+                cos(2 * pi() * b.weekday / 7.0) as weekday_cos,
+                rolling_30.bikes_avg_30m,
+                rolling_30.empty_rate_30m,
+                rolling_30.samples_30m,
+                b.capacity,
+                b.lat,
+                b.lon
+            from base b
+            left join lateral (
+                select
+                    coalesce(l.num_bikes_available, 0) as bikes_lag_5m,
+                    date_diff('minute', l.collected_at, b.collected_at) as minutes_since_lag_5m
+                from station_status_snapshots l
+                where l.station_id = b.station_id
+                    and l.collected_at <= b.collected_at - (5 * interval '1 minute')
+                    and l.collected_at >= b.collected_at - (15 * interval '1 minute')
+                order by l.collected_at desc
+                limit 1
+            ) lag_5 on true
+            left join lateral (
+                select
+                    coalesce(l.num_bikes_available, 0) as bikes_lag_15m,
+                    date_diff('minute', l.collected_at, b.collected_at) as minutes_since_lag_15m
+                from station_status_snapshots l
+                where l.station_id = b.station_id
+                    and l.collected_at <= b.collected_at - (15 * interval '1 minute')
+                    and l.collected_at >= b.collected_at - (25 * interval '1 minute')
+                order by l.collected_at desc
+                limit 1
+            ) lag_15 on true
+            left join lateral (
+                select
+                    round(avg(coalesce(r.num_bikes_available, 0)), 4) as bikes_avg_30m,
+                    round(
+                        avg(case when coalesce(r.num_bikes_available, 0) = 0 then 1.0 else 0.0 end),
+                        4
+                    ) as empty_rate_30m,
+                    count(*) as samples_30m
+                from station_status_snapshots r
+                where r.station_id = b.station_id
+                    and r.collected_at < b.collected_at
+                    and r.collected_at >= b.collected_at - (30 * interval '1 minute')
+            ) rolling_30 on true
+            order by b.station_id
+            """,
+            station_ids,
+        ).df()
 
 
 def temporal_split(df: pd.DataFrame, test_fraction: float) -> tuple[pd.DataFrame, pd.DataFrame, Any]:
