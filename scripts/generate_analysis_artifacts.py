@@ -10,6 +10,7 @@ import nbformat as nbf
 
 from nextbike_analysis.datasets import build_station_availability_dataset
 from nextbike_analysis.modeling import evaluate_baselines, train_models
+from nextbike_analysis.recommendations import evaluate_recommendation_strategies
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +46,13 @@ def main() -> None:
         test_fraction=0.25,
         model_dir=None,
     )
+    recommendation_result = evaluate_recommendation_strategies(
+        db_path=DB_PATH,
+        model_path=ROOT / "data" / "models" / "hist_gradient_boosting.joblib",
+        table_name=TABLE_NAME,
+        test_fraction=0.25,
+        max_distance_m=1000.0,
+    )
     db_summary = load_db_summary()
     dataset_summary = load_dataset_summary()
     write_metric_figure(baseline, model_result)
@@ -56,10 +64,19 @@ def main() -> None:
             build_result,
             baseline,
             model_result,
+            recommendation_result,
         ),
         encoding="utf-8",
     )
-    write_notebook(generated_at, db_summary, dataset_summary, build_result, baseline, model_result)
+    write_notebook(
+        generated_at,
+        db_summary,
+        dataset_summary,
+        build_result,
+        baseline,
+        model_result,
+        recommendation_result,
+    )
     print(f"wrote {REPORT_PATH}")
     print(f"wrote {NOTEBOOK_PATH}")
     print(f"wrote {FIGURE_PATH}")
@@ -151,6 +168,7 @@ def build_markdown_report(
     build_result,
     baseline,
     model_result,
+    recommendation_result,
 ) -> str:
     best_baseline = max(baseline.metrics, key=lambda row: row.f1)
     best_model = max(model_result.metrics, key=lambda row: row.f1)
@@ -232,12 +250,21 @@ Models trained:
 
 ![F1 comparison](figures/model_f1_comparison.png)
 
+## Recommendation Evaluation
+
+Offline simulation over `{recommendation_result.timestamps}` test timestamps and `{len(recommendation_result.origins)}` fixed Brno origins.
+
+Success means the selected station has at least one bike at the 30-minute target.
+
+{recommendation_table(recommendation_result.metrics)}
+
 ## Findings
 
 - The problem is currently dominated by inertia. `empty_now` is still a very strong predictor of `empty_future`.
 - `station_prior_empty_rate` is strong, which means station identity matters.
 - `low_inventory_le_1` has perfect or near-perfect recall but many false positives; useful if the product goal is "never walk to a station likely to be empty".
 - The trained models are useful as scoring/ranking models because ROC AUC and average precision are high; current F1 versus persistence should not be overinterpreted until we have broader daytime coverage.
+- For the current five-origin simulation, requiring at least two bikes is the strongest recommendation rule. It improves reliability at a small walking-distance cost.
 
 ## Next Work
 
@@ -245,7 +272,7 @@ Models trained:
 2. Re-run this report after a morning commute and after one full weekday.
 3. Add threshold tuning for product goals: nearest reliable bike cares more about recall than raw accuracy.
 4. Add weather and event/calendar features later.
-5. Add route-level evaluation: "would this command recommend a station that still has a bike when I arrive?"
+5. Expand route-level evaluation beyond fixed center origins and include realistic walk-to-station travel time.
 """
 
 
@@ -275,6 +302,26 @@ def metrics_table(rows) -> str:
     return "\n".join(lines)
 
 
+def recommendation_table(rows) -> str:
+    lines = [
+        "| Strategy | Success rate | Avg dist m | P90 dist m | No candidate | Avg extra m | Avg empty probability |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in sorted(rows, key=lambda item: item.success_rate or 0, reverse=True):
+        success_rate = f"{row.success_rate:.4f}" if row.success_rate is not None else "n/a"
+        avg_distance = f"{row.avg_distance_m:.0f}" if row.avg_distance_m is not None else "n/a"
+        p90_distance = f"{row.p90_distance_m:.0f}" if row.p90_distance_m is not None else "n/a"
+        avg_extra = f"{row.avg_extra_distance_m:.0f}" if row.avg_extra_distance_m is not None else "n/a"
+        avg_empty = (
+            f"{row.avg_empty_probability:.4f}" if row.avg_empty_probability is not None else "n/a"
+        )
+        lines.append(
+            f"| `{row.label}` | {success_rate} | {avg_distance} | {p90_distance} | "
+            f"{row.no_candidate} | {avg_extra} | {avg_empty} |"
+        )
+    return "\n".join(lines)
+
+
 def write_notebook(
     generated_at: datetime,
     db_summary: dict[str, object],
@@ -282,6 +329,7 @@ def write_notebook(
     build_result,
     baseline,
     model_result,
+    recommendation_result,
 ) -> None:
     notebook = nbf.v4.new_notebook()
     notebook.cells = [
@@ -344,6 +392,21 @@ model_result, _ = train_models(
     model_dir=None,
 )
 [(row.name, row.f1, row.roc_auc) for row in model_result.metrics]"""
+        ),
+        nbf.v4.new_markdown_cell(
+            "## Recommendation Metrics\n\n" + recommendation_table(recommendation_result.metrics)
+        ),
+        nbf.v4.new_code_cell(
+            """from nextbike_analysis.recommendations import evaluate_recommendation_strategies
+
+recommendation_result = evaluate_recommendation_strategies(
+    db_path=DB_PATH,
+    model_path=ROOT / 'data' / 'models' / 'hist_gradient_boosting.joblib',
+    table_name=TABLE_NAME,
+    test_fraction=0.25,
+    max_distance_m=1000.0,
+)
+[(row.label, row.success_rate, row.avg_distance_m) for row in recommendation_result.metrics]"""
         ),
         nbf.v4.new_markdown_cell(
             """## Notes

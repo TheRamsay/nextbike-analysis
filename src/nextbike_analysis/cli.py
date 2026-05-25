@@ -34,6 +34,7 @@ from nextbike_analysis.modeling import (
     train_models,
 )
 from nextbike_analysis.poller import pid_is_running, poller_paths, read_pid
+from nextbike_analysis.recommendations import evaluate_recommendation_strategies
 from nextbike_analysis.reports import get_data_health, get_system_trend
 from nextbike_analysis.storage import SnapshotStore, utc_now
 
@@ -650,6 +651,79 @@ def train_model(
         for name, path in saved_models.items():
             table.add_row(name, str(path))
         console.print(table)
+
+
+@app.command("evaluate-recommendations")
+def evaluate_recommendations(
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+    data_dir: Annotated[Path | None, typer.Option(help="Directory containing model artifacts.")] = None,
+    table_name: Annotated[
+        str,
+        typer.Option(help="Training dataset table name."),
+    ] = "training_station_availability",
+    model_path: Annotated[
+        Path | None,
+        typer.Option(help="Path to trained model. Defaults to data/models/hist_gradient_boosting.joblib."),
+    ] = None,
+    test_fraction: Annotated[
+        float,
+        typer.Option(help="Newest fraction of timestamps used as test set."),
+    ] = 0.25,
+    max_distance_m: Annotated[
+        float,
+        typer.Option(help="Maximum walking distance considered for a recommendation."),
+    ] = 1000.0,
+) -> None:
+    """Evaluate historical nearest-station recommendation strategies."""
+    if not 0 < test_fraction < 1:
+        raise typer.BadParameter("test_fraction must be between 0 and 1")
+    if max_distance_m <= 0:
+        raise typer.BadParameter("max_distance_m must be positive")
+
+    settings = make_settings(None, data_dir, db_path)
+    model_path = model_path or (settings.data_dir / "models" / "hist_gradient_boosting.joblib")
+    try:
+        result = evaluate_recommendation_strategies(
+            db_path=settings.db_path,
+            model_path=model_path,
+            table_name=table_name,
+            test_fraction=test_fraction,
+            max_distance_m=max_distance_m,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    summary = Table(title="Recommendation evaluation")
+    summary.add_column("Metric")
+    summary.add_column("Value")
+    summary.add_row("origins", ", ".join(origin.name for origin in result.origins))
+    summary.add_row("timestamps", str(result.timestamps))
+    summary.add_row("attempts per strategy", str(result.attempts_per_strategy))
+    summary.add_row("max distance m", str(max_distance_m))
+    summary.add_row("model", str(model_path))
+    console.print(summary)
+
+    table = Table(title="Strategies")
+    table.add_column("Strategy")
+    table.add_column("Attempts", justify="right")
+    table.add_column("No candidate", justify="right")
+    table.add_column("Success rate", justify="right")
+    table.add_column("Avg dist m", justify="right")
+    table.add_column("P90 dist m", justify="right")
+    table.add_column("Avg empty prob", justify="right")
+    table.add_column("Avg extra m", justify="right")
+    for row in sorted(result.metrics, key=lambda item: item.success_rate or 0, reverse=True):
+        table.add_row(
+            row.label,
+            str(row.attempts),
+            str(row.no_candidate),
+            f"{row.success_rate:.4f}" if row.success_rate is not None else "n/a",
+            f"{row.avg_distance_m:.0f}" if row.avg_distance_m is not None else "n/a",
+            f"{row.p90_distance_m:.0f}" if row.p90_distance_m is not None else "n/a",
+            f"{row.avg_empty_probability:.4f}" if row.avg_empty_probability is not None else "n/a",
+            f"{row.avg_extra_distance_m:.0f}" if row.avg_extra_distance_m is not None else "n/a",
+        )
+    console.print(table)
 
 
 @app.command("data-health")
