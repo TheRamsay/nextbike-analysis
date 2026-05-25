@@ -1134,6 +1134,14 @@ def nearest(
         bool,
         typer.Option(help="Score nearest stations with the trained 30-minute emptiness model."),
     ] = False,
+    reliable: Annotated[
+        bool,
+        typer.Option(help="Prefer stations with at least --reliable-min-bikes bikes."),
+    ] = False,
+    reliable_min_bikes: Annotated[
+        int,
+        typer.Option(help="Minimum bikes for reliable nearest recommendations."),
+    ] = 2,
     model_path: Annotated[
         Path | None,
         typer.Option(help="Path to a trained sklearn model. Defaults to data/models/hist_gradient_boosting.joblib."),
@@ -1167,6 +1175,8 @@ def nearest(
         raise typer.BadParameter("limit must be positive")
     if max_distance_m is not None and max_distance_m <= 0:
         raise typer.BadParameter("max_distance_m must be positive")
+    if reliable_min_bikes <= 0:
+        raise typer.BadParameter("reliable_min_bikes must be positive")
 
     if refresh:
         metrics = collect_once(settings, language="en", include_free_bikes=False)
@@ -1178,10 +1188,11 @@ def nearest(
 
     bike_filter = "" if include_empty else "and s.num_bikes_available > 0"
     distance_filter = "" if max_distance_m is None else "where distance_m <= ?"
+    candidate_limit = max(limit, 50) if reliable else limit
     params: list[float | int] = [lat, lat, lon]
     if max_distance_m is not None:
         params.append(max_distance_m)
-    params.append(limit)
+    params.append(candidate_limit)
 
     with connect_db(settings.db_path) as con:
         rows = con.execute(
@@ -1229,6 +1240,16 @@ def nearest(
             params,
         ).fetchall()
 
+    nearest_distance = int(rows[0][4]) if rows else None
+    reliable_fallback = False
+    if reliable:
+        reliable_rows = [row for row in rows if int(row[3]) >= reliable_min_bikes]
+        if reliable_rows:
+            rows = reliable_rows[:limit]
+        else:
+            rows = rows[:limit]
+            reliable_fallback = True
+
     predictions = {}
     if predict_risk:
         model_path = model_path or (settings.data_dir / "models" / "hist_gradient_boosting.joblib")
@@ -1248,6 +1269,14 @@ def nearest(
         table.add_column("Now", no_wrap=True)
         table.add_column("Empty 30m", no_wrap=True)
         table.add_column("Rec", no_wrap=True)
+        if reliable:
+            table.add_column("Extra m", justify="right", no_wrap=True)
+        table.add_column("Distance m", justify="right", no_wrap=True)
+    elif reliable:
+        table.add_column("Name", ratio=3)
+        table.add_column("Bikes", justify="right", no_wrap=True)
+        table.add_column("Risk", no_wrap=True)
+        table.add_column("Extra m", justify="right", no_wrap=True)
         table.add_column("Distance m", justify="right", no_wrap=True)
     else:
         table.add_column("Name", ratio=3)
@@ -1260,6 +1289,7 @@ def nearest(
     for row in rows:
         station_id, name, region_id, bikes, distance_m, station_lat, station_lon = row
         current_risk = bike_risk(int(bikes))
+        extra_distance = int(distance_m) - nearest_distance if nearest_distance is not None else 0
         if predict_risk:
             table_row = [
                 str(name),
@@ -1276,20 +1306,41 @@ def nearest(
                         station_recommendation(int(bikes), prediction.empty_probability),
                     ]
                 )
+            if reliable:
+                table_row.append(f"+{extra_distance}")
             table_row.append(str(distance_m))
+        elif reliable:
+            table_row = [
+                str(name),
+                str(bikes),
+                current_risk,
+                f"+{extra_distance}",
+                str(distance_m),
+            ]
         else:
             table_row = [
                 str(name),
                 str(station_id),
                 str(bikes),
                 current_risk,
-                str(distance_m),
             ]
+            table_row.append(str(distance_m))
             table_row.extend([str(station_lat), str(station_lon)])
         table.add_row(
             *table_row,
         )
     console.print(f"[dim]Location source: {location_label}[/dim]")
+    if reliable:
+        if reliable_fallback:
+            console.print(
+                f"[yellow]No station with bikes >= {reliable_min_bikes} found in candidates; "
+                "showing nearest available stations.[/yellow]"
+            )
+        else:
+            console.print(
+                f"[dim]Reliable mode: bikes >= {reliable_min_bikes}; "
+                "Extra m is distance beyond nearest station with a bike.[/dim]"
+            )
     if predict_risk:
         console.print(f"[dim]Risk model: {model_path}[/dim]")
     console.print(table)

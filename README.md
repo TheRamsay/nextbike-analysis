@@ -62,8 +62,10 @@ uv run nextbike station 27619716
 uv run nextbike station Veselá
 uv run nextbike nearest --lat 49.1951 --lon 16.6068
 uv run nextbike nearest --address "Moravské náměstí, Brno"
+uv run nextbike nearest --address "Moravské náměstí, Brno" --reliable
 uv run nextbike nearest --address "Moravské náměstí, Brno" --refresh
 uv run nextbike nearest --address "Moravské náměstí, Brno" --predict-risk
+uv run nextbike nearest --address "Moravské náměstí, Brno" --reliable --predict-risk
 uv run nextbike nearest --whereami
 uv run nextbike dashboard
 uv run nextbike dashboard --once --width 100 --height 30
