@@ -156,6 +156,122 @@ def markdown_table(headers: Sequence[str], rows: Iterable[Sequence[object]]) -> 
     return "\n".join(lines)
 
 
+def format_minutes(minutes: object) -> str:
+    if minutes is None:
+        return "n/a"
+    total_minutes = int(minutes)
+    if total_minutes < 60:
+        return f"{total_minutes}m"
+    hours, remainder = divmod(total_minutes, 60)
+    if remainder == 0:
+        return f"{hours}h"
+    return f"{hours}h {remainder}m"
+
+
+def format_distance(meters: object) -> str:
+    if meters is None:
+        return "n/a"
+    distance_m = int(meters)
+    if distance_m < 1000:
+        return f"{distance_m}m"
+    return f"{distance_m / 1000:.1f}km"
+
+
+def short_bike_id(bike_id: object) -> str:
+    value = str(bike_id)
+    if len(value) <= 18:
+        return value
+    return f"{value[:10]}...{value[-6:]}"
+
+
+def area_station_cte() -> str:
+    distance_sql = """
+        cast(round(
+            6371000 * 2 * asin(sqrt(
+                power(sin(radians((i.lat - ?) / 2)), 2)
+                + cos(radians(?)) * cos(radians(i.lat))
+                * power(sin(radians((i.lon - ?) / 2)), 2)
+            ))
+        ) as integer)
+    """
+    return f"""
+        with station_info as ({LATEST_STATION_INFO_SQL}),
+        stations as (
+            select
+                i.station_id,
+                coalesce(i.name, i.station_id) as name,
+                i.region_id,
+                i.lat,
+                i.lon,
+                {distance_sql} as distance_m
+            from station_info i
+        )
+    """
+
+
+def bike_moves_cte() -> str:
+    return f"""
+        {area_station_cte()},
+        bike_observations as (
+            select
+                f.bike_id,
+                f.collected_at,
+                f.station_id,
+                coalesce(i.name, f.station_id, 'free-floating') as station_name,
+                f.lat,
+                f.lon,
+                st.distance_m as origin_distance_m,
+                lag(f.collected_at) over (
+                    partition by f.bike_id
+                    order by f.collected_at
+                ) as previous_collected_at,
+                lag(f.station_id) over (
+                    partition by f.bike_id
+                    order by f.collected_at
+                ) as previous_station_id,
+                lag(coalesce(i.name, f.station_id, 'free-floating')) over (
+                    partition by f.bike_id
+                    order by f.collected_at
+                ) as previous_station_name,
+                lag(f.lat) over (
+                    partition by f.bike_id
+                    order by f.collected_at
+                ) as previous_lat,
+                lag(f.lon) over (
+                    partition by f.bike_id
+                    order by f.collected_at
+                ) as previous_lon,
+                lag(st.distance_m) over (
+                    partition by f.bike_id
+                    order by f.collected_at
+                ) as previous_origin_distance_m
+            from free_bike_status_snapshots f
+            left join station_info i
+                on i.station_id = f.station_id
+            left join stations st
+                on st.station_id = f.station_id
+        ),
+        bike_moves as (
+            select
+                *,
+                date_diff('minute', previous_collected_at, collected_at) as window_minutes,
+                case
+                    when previous_lat is null or previous_lon is null or lat is null or lon is null
+                        then null
+                    else cast(round(
+                        6371000 * 2 * asin(sqrt(
+                            power(sin(radians((lat - previous_lat) / 2)), 2)
+                            + cos(radians(previous_lat)) * cos(radians(lat))
+                            * power(sin(radians((lon - previous_lon) / 2)), 2)
+                        ))
+                    ) as integer)
+                end as move_distance_m
+            from bike_observations
+            where previous_collected_at is not null
+        )
+    """
+
+
 def make_settings(
     gbfs_url: str | None,
     data_dir: Path | None,
@@ -1392,28 +1508,7 @@ def area_trend(
     if limit <= 0:
         raise typer.BadParameter("limit must be positive")
 
-    distance_sql = """
-        cast(round(
-            6371000 * 2 * asin(sqrt(
-                power(sin(radians((i.lat - ?) / 2)), 2)
-                + cos(radians(?)) * cos(radians(i.lat))
-                * power(sin(radians((i.lon - ?) / 2)), 2)
-            ))
-        ) as integer)
-    """
-    station_cte = f"""
-        with station_info as ({LATEST_STATION_INFO_SQL}),
-        stations as (
-            select
-                i.station_id,
-                coalesce(i.name, i.station_id) as name,
-                i.region_id,
-                i.lat,
-                i.lon,
-                {distance_sql} as distance_m
-            from station_info i
-        )
-    """
+    station_cte = area_station_cte()
 
     with connect_db(settings.db_path) as con:
         coverage_row = con.execute(
@@ -1727,6 +1822,645 @@ def area_trend(
         ]
         report_path.write_text("\n".join(report), encoding="utf-8")
         console.print(f"[green]wrote report[/green] {report_path}")
+
+
+@app.command("bike-moves")
+def bike_moves(
+    lat: Annotated[float | None, typer.Option(help="Latitude of the area origin.")] = None,
+    lon: Annotated[float | None, typer.Option(help="Longitude of the area origin.")] = None,
+    address: Annotated[str | None, typer.Option(help="Address to geocode as the area origin.")] = None,
+    whereami: Annotated[
+        bool,
+        typer.Option(help="Use approximate IP-based geolocation for the area origin."),
+    ] = False,
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+    radius_m: Annotated[int, typer.Option(help="Include moves touching this radius in meters.")] = 600,
+    limit: Annotated[int, typer.Option(help="Maximum inferred moves to show.")] = 30,
+    max_window_minutes: Annotated[
+        int,
+        typer.Option(help="Discard seen-again moves whose last-seen to next-seen window is longer than this."),
+    ] = 240,
+    min_move_m: Annotated[
+        int,
+        typer.Option(help="Minimum GPS movement for station-less changes."),
+    ] = 100,
+    open_after_minutes: Annotated[
+        int,
+        typer.Option(help="Treat locally last-seen bikes as open departures after this many minutes."),
+    ] = 3,
+    timezone: Annotated[str, typer.Option(help="Timezone for displayed local hours.")] = "Europe/Prague",
+) -> None:
+    """Show inferred bike movements that start or end near an address."""
+    settings = make_settings(None, None, db_path)
+    lat, lon, location_label = resolve_origin(settings, lat, lon, address, whereami)
+    if radius_m <= 0:
+        raise typer.BadParameter("radius_m must be positive")
+    if limit <= 0:
+        raise typer.BadParameter("limit must be positive")
+    if max_window_minutes <= 0:
+        raise typer.BadParameter("max_window_minutes must be positive")
+    if min_move_m < 0:
+        raise typer.BadParameter("min_move_m must be non-negative")
+    if open_after_minutes <= 0:
+        raise typer.BadParameter("open_after_minutes must be positive")
+
+    with connect_db(settings.db_path) as con:
+        rows = con.execute(
+            f"""
+            {bike_moves_cte()},
+            latest_feed as (
+                select max(collected_at) as latest_collected_at
+                from free_bike_status_snapshots
+            ),
+            last_observations as (
+                select
+                    *,
+                    row_number() over (
+                        partition by bike_id
+                        order by collected_at desc
+                    ) as rn
+                from bike_observations
+            ),
+            inferred_events as (
+                select
+                    'seen-again' as status,
+                    previous_collected_at as departed_after,
+                    collected_at as next_seen_at,
+                    strftime(timezone(?, previous_collected_at), '%H:%M') as local_departed_after,
+                    bike_id,
+                    previous_station_name as from_name,
+                    station_name as to_name,
+                    previous_station_id as from_station_id,
+                    station_id as to_station_id,
+                    previous_origin_distance_m as from_origin_distance_m,
+                    origin_distance_m as to_origin_distance_m,
+                    window_minutes,
+                    move_distance_m
+                from bike_moves
+                where
+                    (
+                        coalesce(previous_station_id, '') <> coalesce(station_id, '')
+                        or coalesce(move_distance_m, 0) >= ?
+                    )
+                    and window_minutes <= ?
+                    and (
+                        coalesce(previous_origin_distance_m, 1000000000) <= ?
+                        or coalesce(origin_distance_m, 1000000000) <= ?
+                    )
+
+                union all
+
+                select
+                    'not-seen' as status,
+                    o.collected_at as departed_after,
+                    cast(null as timestamptz) as next_seen_at,
+                    strftime(timezone(?, o.collected_at), '%H:%M') as local_departed_after,
+                    o.bike_id,
+                    o.station_name as from_name,
+                    'not seen again' as to_name,
+                    o.station_id as from_station_id,
+                    cast(null as varchar) as to_station_id,
+                    o.origin_distance_m as from_origin_distance_m,
+                    cast(null as integer) as to_origin_distance_m,
+                    date_diff('minute', o.collected_at, l.latest_collected_at) as window_minutes,
+                    cast(null as integer) as move_distance_m
+                from last_observations o
+                cross join latest_feed l
+                where
+                    o.rn = 1
+                    and o.station_id is not null
+                    and coalesce(o.origin_distance_m, 1000000000) <= ?
+                    and date_diff('minute', o.collected_at, l.latest_collected_at) >= ?
+            )
+            select
+                status,
+                departed_after,
+                next_seen_at,
+                local_departed_after,
+                bike_id,
+                from_name,
+                to_name,
+                from_origin_distance_m,
+                to_origin_distance_m,
+                window_minutes,
+                move_distance_m
+            from inferred_events
+            order by departed_after desc, bike_id
+            limit ?
+            """,
+            [
+                lat,
+                lat,
+                lon,
+                timezone,
+                min_move_m,
+                max_window_minutes,
+                radius_m,
+                radius_m,
+                timezone,
+                radius_m,
+                open_after_minutes,
+                limit,
+            ],
+        ).fetchall()
+
+        summary_row = con.execute(
+            f"""
+            {bike_moves_cte()},
+            latest_feed as (
+                select max(collected_at) as latest_collected_at
+                from free_bike_status_snapshots
+            ),
+            last_observations as (
+                select
+                    *,
+                    row_number() over (
+                        partition by bike_id
+                        order by collected_at desc
+                    ) as rn
+                from bike_observations
+            ),
+            inferred_events as (
+                select
+                    'seen-again' as status,
+                    previous_collected_at as departed_after,
+                    bike_id
+                from bike_moves
+                where
+                    (
+                        coalesce(previous_station_id, '') <> coalesce(station_id, '')
+                        or coalesce(move_distance_m, 0) >= ?
+                    )
+                    and window_minutes <= ?
+                    and (
+                        coalesce(previous_origin_distance_m, 1000000000) <= ?
+                        or coalesce(origin_distance_m, 1000000000) <= ?
+                    )
+
+                union all
+
+                select
+                    'not-seen' as status,
+                    o.collected_at as departed_after,
+                    o.bike_id
+                from last_observations o
+                cross join latest_feed l
+                where
+                    o.rn = 1
+                    and o.station_id is not null
+                    and coalesce(o.origin_distance_m, 1000000000) <= ?
+                    and date_diff('minute', o.collected_at, l.latest_collected_at) >= ?
+            )
+            select
+                count(*) as moves,
+                count(distinct bike_id) as bikes,
+                count_if(status = 'seen-again') as known_destination_moves,
+                count_if(status = 'not-seen') as open_departures,
+                min(departed_after) as first_move,
+                max(departed_after) as latest_move
+            from inferred_events
+            """,
+            [
+                lat,
+                lat,
+                lon,
+                min_move_m,
+                max_window_minutes,
+                radius_m,
+                radius_m,
+                radius_m,
+                open_after_minutes,
+            ],
+        ).fetchone()
+
+    summary = Table(title=f"Inferred bike moves touching {lat:.6f}, {lon:.6f}")
+    summary.add_column("Metric")
+    summary.add_column("Value")
+    summary.add_row("location source", location_label)
+    summary.add_row("radius", f"{radius_m} m")
+    summary.add_row("max seen-again window", format_minutes(max_window_minutes))
+    summary.add_row("open after", format_minutes(open_after_minutes))
+    summary.add_row("moves", str(summary_row[0] or 0))
+    summary.add_row("distinct bikes", str(summary_row[1] or 0))
+    summary.add_row("known destinations", str(summary_row[2] or 0))
+    summary.add_row("not seen again yet", str(summary_row[3] or 0))
+    summary.add_row("first move", str(summary_row[4]))
+    summary.add_row("latest move", str(summary_row[5]))
+    console.print(summary)
+
+    console.print(
+        "[dim]Moves are inferred from last available bike observation to next available "
+        "observation; the feed does not expose the exact ridden route.[/dim]"
+    )
+
+    table = Table(title=f"Recent inferred moves ({len(rows)} shown)")
+    table.add_column("Status", no_wrap=True)
+    table.add_column("Time", no_wrap=True)
+    table.add_column("Bike ID", no_wrap=True)
+    table.add_column("Route", ratio=4)
+    table.add_column("Window", justify="right", no_wrap=True)
+    table.add_column("Move", justify="right", no_wrap=True)
+    for (
+        status,
+        _departed_after,
+        _next_seen_at,
+        local_departed_after,
+        bike_id,
+        from_name,
+        to_name,
+        from_origin_distance_m,
+        to_origin_distance_m,
+        window_minutes,
+        move_distance_m,
+    ) in rows:
+        table.add_row(
+            str(status),
+            str(local_departed_after),
+            short_bike_id(bike_id),
+            f"{from_name} -> {to_name}",
+            f"{format_minutes(window_minutes)}+" if status == "not-seen" else format_minutes(window_minutes),
+            format_distance(move_distance_m),
+        )
+    console.print(table)
+
+
+@app.command("station-departures")
+def station_departures(
+    lat: Annotated[float | None, typer.Option(help="Latitude of the area origin.")] = None,
+    lon: Annotated[float | None, typer.Option(help="Longitude of the area origin.")] = None,
+    address: Annotated[str | None, typer.Option(help="Address to geocode as the area origin.")] = None,
+    whereami: Annotated[
+        bool,
+        typer.Option(help="Use approximate IP-based geolocation for the area origin."),
+    ] = False,
+    db_path: Annotated[Path | None, typer.Option(help="DuckDB file path.")] = None,
+    radius_m: Annotated[int, typer.Option(help="Departure station radius in meters.")] = 600,
+    limit: Annotated[int, typer.Option(help="Maximum recent departure rows to show.")] = 30,
+    max_window_minutes: Annotated[
+        int,
+        typer.Option(help="Discard seen-again departures whose last-seen to next-seen window is longer than this."),
+    ] = 240,
+    open_after_minutes: Annotated[
+        int,
+        typer.Option(help="Treat locally last-seen bikes as open departures after this many minutes."),
+    ] = 3,
+    timezone: Annotated[str, typer.Option(help="Timezone for hourly grouping.")] = "Europe/Prague",
+) -> None:
+    """Show inferred departures from stations near an address."""
+    settings = make_settings(None, None, db_path)
+    lat, lon, location_label = resolve_origin(settings, lat, lon, address, whereami)
+    if radius_m <= 0:
+        raise typer.BadParameter("radius_m must be positive")
+    if limit <= 0:
+        raise typer.BadParameter("limit must be positive")
+    if max_window_minutes <= 0:
+        raise typer.BadParameter("max_window_minutes must be positive")
+    if open_after_minutes <= 0:
+        raise typer.BadParameter("open_after_minutes must be positive")
+
+    with connect_db(settings.db_path) as con:
+        hourly_rows = con.execute(
+            f"""
+            {bike_moves_cte()},
+            latest_feed as (
+                select max(collected_at) as latest_collected_at
+                from free_bike_status_snapshots
+            ),
+            last_observations as (
+                select
+                    *,
+                    row_number() over (
+                        partition by bike_id
+                        order by collected_at desc
+                    ) as rn
+                from bike_observations
+            ),
+            inferred_departures as (
+                select
+                    'seen-again' as status,
+                    previous_collected_at as departed_after,
+                    collected_at as next_seen_at,
+                    bike_id,
+                    previous_station_name as from_name,
+                    station_name as to_name,
+                    previous_station_id as from_station_id,
+                    station_id as to_station_id,
+                    previous_origin_distance_m as from_origin_distance_m,
+                    origin_distance_m as to_origin_distance_m,
+                    window_minutes,
+                    move_distance_m
+                from bike_moves
+                where
+                    previous_station_id is not null
+                    and coalesce(previous_station_id, '') <> coalesce(station_id, '')
+                    and coalesce(previous_origin_distance_m, 1000000000) <= ?
+                    and window_minutes <= ?
+
+                union all
+
+                select
+                    'not-seen' as status,
+                    o.collected_at as departed_after,
+                    cast(null as timestamptz) as next_seen_at,
+                    o.bike_id,
+                    o.station_name as from_name,
+                    'not seen again' as to_name,
+                    o.station_id as from_station_id,
+                    cast(null as varchar) as to_station_id,
+                    o.origin_distance_m as from_origin_distance_m,
+                    cast(null as integer) as to_origin_distance_m,
+                    date_diff('minute', o.collected_at, l.latest_collected_at) as window_minutes,
+                    cast(null as integer) as move_distance_m
+                from last_observations o
+                cross join latest_feed l
+                where
+                    o.rn = 1
+                    and o.station_id is not null
+                    and coalesce(o.origin_distance_m, 1000000000) <= ?
+                    and date_diff('minute', o.collected_at, l.latest_collected_at) >= ?
+            )
+            select
+                strftime(timezone(?, departed_after), '%H:00') as local_hour,
+                count(*) as departures,
+                count(distinct bike_id) as bikes,
+                count_if(status = 'seen-again') as known_destinations,
+                count_if(status = 'not-seen') as open_departures,
+                round(avg(window_minutes), 1) as avg_window_minutes
+            from inferred_departures
+            group by local_hour
+            order by local_hour
+            """,
+            [
+                lat,
+                lat,
+                lon,
+                radius_m,
+                max_window_minutes,
+                radius_m,
+                open_after_minutes,
+                timezone,
+            ],
+        ).fetchall()
+
+        destination_rows = con.execute(
+            f"""
+            {bike_moves_cte()}
+            select
+                previous_station_name,
+                station_name,
+                count(*) as departures,
+                round(avg(window_minutes), 1) as avg_window_minutes,
+                round(avg(move_distance_m), 0) as avg_move_distance_m
+            from bike_moves
+            where
+                previous_station_id is not null
+                and coalesce(previous_station_id, '') <> coalesce(station_id, '')
+                and coalesce(previous_origin_distance_m, 1000000000) <= ?
+                and window_minutes <= ?
+            group by previous_station_name, station_name
+            order by departures desc, previous_station_name, station_name
+            limit ?
+            """,
+            [lat, lat, lon, radius_m, max_window_minutes, limit],
+        ).fetchall()
+
+        detail_rows = con.execute(
+            f"""
+            {bike_moves_cte()},
+            latest_feed as (
+                select max(collected_at) as latest_collected_at
+                from free_bike_status_snapshots
+            ),
+            last_observations as (
+                select
+                    *,
+                    row_number() over (
+                        partition by bike_id
+                        order by collected_at desc
+                    ) as rn
+                from bike_observations
+            ),
+            inferred_departures as (
+                select
+                    'seen-again' as status,
+                    previous_collected_at as departed_after,
+                    collected_at as next_seen_at,
+                    strftime(timezone(?, previous_collected_at), '%H:%M') as local_departed_after,
+                    bike_id,
+                    previous_station_name as from_name,
+                    station_name as to_name,
+                    previous_origin_distance_m as from_origin_distance_m,
+                    origin_distance_m as to_origin_distance_m,
+                    window_minutes,
+                    move_distance_m
+                from bike_moves
+                where
+                    previous_station_id is not null
+                    and coalesce(previous_station_id, '') <> coalesce(station_id, '')
+                    and coalesce(previous_origin_distance_m, 1000000000) <= ?
+                    and window_minutes <= ?
+
+                union all
+
+                select
+                    'not-seen' as status,
+                    o.collected_at as departed_after,
+                    cast(null as timestamptz) as next_seen_at,
+                    strftime(timezone(?, o.collected_at), '%H:%M') as local_departed_after,
+                    o.bike_id,
+                    o.station_name as from_name,
+                    'not seen again' as to_name,
+                    o.origin_distance_m as from_origin_distance_m,
+                    cast(null as integer) as to_origin_distance_m,
+                    date_diff('minute', o.collected_at, l.latest_collected_at) as window_minutes,
+                    cast(null as integer) as move_distance_m
+                from last_observations o
+                cross join latest_feed l
+                where
+                    o.rn = 1
+                    and o.station_id is not null
+                    and coalesce(o.origin_distance_m, 1000000000) <= ?
+                    and date_diff('minute', o.collected_at, l.latest_collected_at) >= ?
+            )
+            select
+                status,
+                departed_after,
+                next_seen_at,
+                local_departed_after,
+                bike_id,
+                from_name,
+                to_name,
+                from_origin_distance_m,
+                to_origin_distance_m,
+                window_minutes,
+                move_distance_m
+            from inferred_departures
+            order by departed_after desc, bike_id
+            limit ?
+            """,
+            [
+                lat,
+                lat,
+                lon,
+                timezone,
+                radius_m,
+                max_window_minutes,
+                timezone,
+                radius_m,
+                open_after_minutes,
+                limit,
+            ],
+        ).fetchall()
+
+        summary_row = con.execute(
+            f"""
+            {bike_moves_cte()},
+            latest_feed as (
+                select max(collected_at) as latest_collected_at
+                from free_bike_status_snapshots
+            ),
+            last_observations as (
+                select
+                    *,
+                    row_number() over (
+                        partition by bike_id
+                        order by collected_at desc
+                    ) as rn
+                from bike_observations
+            ),
+            inferred_departures as (
+                select
+                    'seen-again' as status,
+                    previous_collected_at as departed_after,
+                    bike_id,
+                    previous_station_id as from_station_id
+                from bike_moves
+                where
+                    previous_station_id is not null
+                    and coalesce(previous_station_id, '') <> coalesce(station_id, '')
+                    and coalesce(previous_origin_distance_m, 1000000000) <= ?
+                    and window_minutes <= ?
+
+                union all
+
+                select
+                    'not-seen' as status,
+                    o.collected_at as departed_after,
+                    o.bike_id,
+                    o.station_id as from_station_id
+                from last_observations o
+                cross join latest_feed l
+                where
+                    o.rn = 1
+                    and o.station_id is not null
+                    and coalesce(o.origin_distance_m, 1000000000) <= ?
+                    and date_diff('minute', o.collected_at, l.latest_collected_at) >= ?
+            )
+            select
+                count(*) as departures,
+                count(distinct bike_id) as bikes,
+                count(distinct from_station_id) as origin_stations,
+                count_if(status = 'seen-again') as known_destinations,
+                count_if(status = 'not-seen') as open_departures,
+                min(departed_after) as first_departure,
+                max(departed_after) as latest_departure
+            from inferred_departures
+            """,
+            [
+                lat,
+                lat,
+                lon,
+                radius_m,
+                max_window_minutes,
+                radius_m,
+                open_after_minutes,
+            ],
+        ).fetchone()
+
+    summary = Table(title=f"Inferred station departures around {lat:.6f}, {lon:.6f}")
+    summary.add_column("Metric")
+    summary.add_column("Value")
+    summary.add_row("location source", location_label)
+    summary.add_row("radius", f"{radius_m} m")
+    summary.add_row("max seen-again window", format_minutes(max_window_minutes))
+    summary.add_row("open after", format_minutes(open_after_minutes))
+    summary.add_row("departures", str(summary_row[0] or 0))
+    summary.add_row("distinct bikes", str(summary_row[1] or 0))
+    summary.add_row("origin stations", str(summary_row[2] or 0))
+    summary.add_row("known destinations", str(summary_row[3] or 0))
+    summary.add_row("not seen again yet", str(summary_row[4] or 0))
+    summary.add_row("first departure", str(summary_row[5]))
+    summary.add_row("latest departure", str(summary_row[6]))
+    console.print(summary)
+
+    console.print(
+        "[dim]Departure time is the last snapshot where the bike was available at the origin; "
+        "destination is the next snapshot where the same bike appeared again.[/dim]"
+    )
+
+    hourly_table = Table(title="Departures by local hour")
+    hourly_table.add_column("Hour")
+    hourly_table.add_column("Departures", justify="right")
+    hourly_table.add_column("Bikes", justify="right")
+    hourly_table.add_column("Known", justify="right")
+    hourly_table.add_column("Open", justify="right")
+    hourly_table.add_column("Avg window", justify="right")
+    for local_hour, departures, bikes, known_destinations, open_departures, avg_window_minutes in hourly_rows:
+        hourly_table.add_row(
+            str(local_hour),
+            str(departures),
+            str(bikes),
+            str(known_destinations),
+            str(open_departures),
+            format_minutes(round(float(avg_window_minutes))) if avg_window_minutes is not None else "n/a",
+        )
+    console.print(hourly_table)
+
+    destination_table = Table(title="Top inferred destinations")
+    destination_table.add_column("From", ratio=2)
+    destination_table.add_column("To", ratio=2)
+    destination_table.add_column("Departures", justify="right")
+    destination_table.add_column("Avg window", justify="right")
+    destination_table.add_column("Avg move", justify="right")
+    for from_name, to_name, departures, avg_window_minutes, avg_move_distance_m in destination_rows:
+        destination_table.add_row(
+            str(from_name),
+            str(to_name),
+            str(departures),
+            format_minutes(round(float(avg_window_minutes))) if avg_window_minutes is not None else "n/a",
+            format_distance(avg_move_distance_m),
+        )
+    console.print(destination_table)
+
+    detail_table = Table(title=f"Recent inferred departures ({len(detail_rows)} shown)")
+    detail_table.add_column("Status", no_wrap=True)
+    detail_table.add_column("Time", no_wrap=True)
+    detail_table.add_column("Bike ID", no_wrap=True)
+    detail_table.add_column("Route", ratio=4)
+    detail_table.add_column("Window", justify="right", no_wrap=True)
+    detail_table.add_column("Move", justify="right", no_wrap=True)
+    for (
+        status,
+        _departed_after,
+        _next_seen_at,
+        local_departed_after,
+        bike_id,
+        from_name,
+        to_name,
+        _from_origin_distance_m,
+        to_origin_distance_m,
+        window_minutes,
+        move_distance_m,
+    ) in detail_rows:
+        detail_table.add_row(
+            str(status),
+            str(local_departed_after),
+            short_bike_id(bike_id),
+            f"{from_name} -> {to_name}",
+            f"{format_minutes(window_minutes)}+" if status == "not-seen" else format_minutes(window_minutes),
+            format_distance(move_distance_m),
+        )
+    console.print(detail_table)
 
 
 @app.command()
