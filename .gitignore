@@ -11,3 +11,4 @@ data/
 *.duckdb.wal
 
 reports/local_*.md
+reports/local_*/
